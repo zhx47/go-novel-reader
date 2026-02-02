@@ -34,12 +34,6 @@ func GetDataDirWithFallback() string {
 	return ".go-novel-reader-data"
 }
 
-// NewDefaultJSONStore 使用默认路径创建存储
-func NewDefaultJSONStore() (*JSONStore, error) {
-	dataDir := GetDataDirWithFallback()
-	return NewJSONStore(dataDir)
-}
-
 // NewDefaultSQLiteStore 使用默认路径创建SQLite存储
 func NewDefaultSQLiteStore() (*SQLiteStore, error) {
 	dataDir := GetDataDirWithFallback()
