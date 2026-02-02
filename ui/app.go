@@ -10,6 +10,7 @@ import (
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/mattn/go-runewidth"
 
 	"go-novel-reader/config"
 	"go-novel-reader/httpclient"
@@ -237,6 +238,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case StateSourceSwitch:
 			return m.updateSourceSwitch(msg)
 		}
+
+	case tea.MouseMsg:
+		return m.handleMouse(msg)
 
 	case rulesLoadedMsg:
 		m.rules = msg.rules
@@ -832,9 +836,20 @@ func (m Model) wrapContent(content string) []string {
 
 		runes := []rune(paragraph)
 		for len(runes) > 0 {
-			end := maxWidth
-			if end > len(runes) {
-				end = len(runes)
+			// 按实际显示宽度计算换行位置
+			lineWidth := 0
+			end := 0
+			for i, r := range runes {
+				w := runewidth.RuneWidth(r)
+				if lineWidth+w > maxWidth {
+					break
+				}
+				lineWidth += w
+				end = i + 1
+			}
+			if end == 0 && len(runes) > 0 {
+				// 单个字符超宽，至少取一个
+				end = 1
 			}
 			lines = append(lines, string(runes[:end]))
 			runes = runes[end:]
@@ -1129,40 +1144,28 @@ func (m Model) updateReader(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "n", "right", "l":
 		// 下一章
 		if m.chapterIndex < len(m.chapters)-1 {
-			// 保存当前进度
-			if cmd := m.saveProgress(); cmd != nil {
-				// 异步保存，不等待
-			}
 			m.chapterIndex++
 			m.loading = true
 			m.statusMsg = "加载下一章..."
-			return m, m.loadChapter(m.chapterIndex)
+			// 同时保存进度和加载下一章
+			return m, tea.Batch(m.saveProgress(), m.loadChapter(m.chapterIndex))
 		}
 	case "p", "left", "h":
 		// 上一章
 		if m.chapterIndex > 0 {
-			// 保存当前进度
-			if cmd := m.saveProgress(); cmd != nil {
-				// 异步保存，不等待
-			}
 			m.chapterIndex--
 			m.loading = true
 			m.statusMsg = "加载上一章..."
-			return m, m.loadChapter(m.chapterIndex)
+			// 同时保存进度和加载上一章
+			return m, tea.Batch(m.saveProgress(), m.loadChapter(m.chapterIndex))
 		}
 	case "t":
 		// 返回目录
-		if cmd := m.saveProgress(); cmd != nil {
-			return m, cmd
-		}
 		m.state = StateToc
+		return m, m.saveProgress()
 	case "c":
 		// 切换书源
 		if m.currentBook != nil && len(m.currentBook.Sources) > 1 {
-			// 保存当前进度
-			if cmd := m.saveProgress(); cmd != nil {
-				// 异步保存
-			}
 			m.availableSources = m.currentBook.Sources
 			m.switchIndex = 0
 			for i, s := range m.availableSources {
@@ -1172,6 +1175,7 @@ func (m Model) updateReader(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				}
 			}
 			m.state = StateSourceSwitch
+			return m, m.saveProgress()
 		} else {
 			m.statusMsg = "只有一个书源，无法切换"
 		}
@@ -1225,6 +1229,210 @@ func (m Model) updateSourceSwitch(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.statusMsg = "已是当前书源"
 				m.state = StateToc
 			}
+		}
+	}
+	return m, nil
+}
+
+// handleMouse 处理鼠标事件
+func (m Model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
+	switch msg.Button {
+	case tea.MouseButtonWheelUp:
+		return m.handleScrollUp()
+	case tea.MouseButtonWheelDown:
+		return m.handleScrollDown()
+	case tea.MouseButtonLeft:
+		if msg.Action == tea.MouseActionRelease {
+			return m.handleClick(msg.X, msg.Y)
+		}
+	}
+	return m, nil
+}
+
+// handleScrollUp 处理向上滚动
+func (m Model) handleScrollUp() (tea.Model, tea.Cmd) {
+	switch m.state {
+	case StateMainMenu:
+		if m.menuIndex > 0 {
+			m.menuIndex--
+		}
+	case StateBookShelf:
+		if m.bookshelfIndex > 0 {
+			m.bookshelfIndex--
+		}
+	case StateSearchResult:
+		resultCount := 0
+		if m.aggregatedResults != nil {
+			resultCount = len(m.aggregatedResults.Results)
+		} else {
+			resultCount = len(m.searchResults)
+		}
+		if m.resultIndex > 0 && resultCount > 0 {
+			m.resultIndex--
+		}
+	case StateToc:
+		if m.chapterIndex > 0 {
+			m.chapterIndex--
+			if m.chapterIndex < m.tocOffset {
+				m.tocOffset = m.chapterIndex
+			}
+		}
+	case StateReader:
+		if m.lineOffset > 0 {
+			m.lineOffset -= 3
+			if m.lineOffset < 0 {
+				m.lineOffset = 0
+			}
+		}
+	case StateSourceSwitch:
+		if m.switchIndex > 0 {
+			m.switchIndex--
+		}
+	}
+	return m, nil
+}
+
+// handleScrollDown 处理向下滚动
+func (m Model) handleScrollDown() (tea.Model, tea.Cmd) {
+	switch m.state {
+	case StateMainMenu:
+		if m.menuIndex < len(mainMenuItems)-1 {
+			m.menuIndex++
+		}
+	case StateBookShelf:
+		books := m.getBookshelfBooks()
+		if m.bookshelfIndex < len(books)-1 {
+			m.bookshelfIndex++
+		}
+	case StateSearchResult:
+		resultCount := 0
+		if m.aggregatedResults != nil {
+			resultCount = len(m.aggregatedResults.Results)
+		} else {
+			resultCount = len(m.searchResults)
+		}
+		if m.resultIndex < resultCount-1 {
+			m.resultIndex++
+		}
+	case StateToc:
+		visibleItems := m.height - 10
+		if visibleItems < 5 {
+			visibleItems = 5
+		}
+		if m.chapterIndex < len(m.chapters)-1 {
+			m.chapterIndex++
+			if m.chapterIndex >= m.tocOffset+visibleItems {
+				m.tocOffset = m.chapterIndex - visibleItems + 1
+			}
+		}
+	case StateReader:
+		maxOffset := len(m.contentLines) - m.linesPerPage
+		if maxOffset < 0 {
+			maxOffset = 0
+		}
+		if m.lineOffset < maxOffset {
+			m.lineOffset += 3
+			if m.lineOffset > maxOffset {
+				m.lineOffset = maxOffset
+			}
+		}
+	case StateSourceSwitch:
+		if m.switchIndex < len(m.availableSources)-1 {
+			m.switchIndex++
+		}
+	}
+	return m, nil
+}
+
+// handleClick 处理鼠标点击
+func (m Model) handleClick(x, y int) (tea.Model, tea.Cmd) {
+	// contentStyle 有 padding(1, 2)，所以内容区域从 y=1 开始
+	// 标题占用约 2-3 行
+	contentStartY := 4 // 标题 + 空行后的内容起始行
+
+	switch m.state {
+	case StateMainMenu:
+		// 主菜单项从第4行开始（标题2行 + 空行1行 + padding 1行）
+		clickedIndex := y - contentStartY
+		if clickedIndex >= 0 && clickedIndex < len(mainMenuItems) {
+			m.menuIndex = clickedIndex
+			// 双击效果：如果点击的是当前选中项，则进入
+			return m.updateMainMenu(tea.KeyMsg{Type: tea.KeyEnter})
+		}
+
+	case StateBookShelf:
+		books := m.getBookshelfBooks()
+		if len(books) == 0 {
+			return m, nil
+		}
+		visibleItems := m.height - 10
+		if visibleItems < 5 {
+			visibleItems = 5
+		}
+		start := 0
+		if m.bookshelfIndex >= visibleItems {
+			start = m.bookshelfIndex - visibleItems + 1
+		}
+		clickedIndex := y - contentStartY + start
+		if clickedIndex >= 0 && clickedIndex < len(books) {
+			if m.bookshelfIndex == clickedIndex {
+				// 点击已选中项，进入
+				return m.updateBookShelf(tea.KeyMsg{Type: tea.KeyEnter})
+			}
+			m.bookshelfIndex = clickedIndex
+		}
+
+	case StateSearchResult:
+		resultCount := 0
+		if m.aggregatedResults != nil {
+			resultCount = len(m.aggregatedResults.Results)
+		} else {
+			resultCount = len(m.searchResults)
+		}
+		if resultCount == 0 {
+			return m, nil
+		}
+		visibleItems := m.height - 14
+		if visibleItems < 3 {
+			visibleItems = 3
+		}
+		start := 0
+		if m.resultIndex >= visibleItems {
+			start = m.resultIndex - visibleItems + 1
+		}
+		clickedIndex := y - contentStartY + start
+		if clickedIndex >= 0 && clickedIndex < resultCount {
+			if m.resultIndex == clickedIndex {
+				// 点击已选中项，进入
+				return m.updateSearchResult(tea.KeyMsg{Type: tea.KeyEnter})
+			}
+			m.resultIndex = clickedIndex
+		}
+
+	case StateToc:
+		if len(m.chapters) == 0 {
+			return m, nil
+		}
+		clickedIndex := y - contentStartY + m.tocOffset
+		if clickedIndex >= 0 && clickedIndex < len(m.chapters) {
+			if m.chapterIndex == clickedIndex {
+				// 点击已选中项，进入阅读
+				return m.updateToc(tea.KeyMsg{Type: tea.KeyEnter})
+			}
+			m.chapterIndex = clickedIndex
+		}
+
+	case StateSourceSwitch:
+		if len(m.availableSources) == 0 {
+			return m, nil
+		}
+		clickedIndex := y - contentStartY
+		if clickedIndex >= 0 && clickedIndex < len(m.availableSources) {
+			if m.switchIndex == clickedIndex {
+				// 点击已选中项，确认切换
+				return m.updateSourceSwitch(tea.KeyMsg{Type: tea.KeyEnter})
+			}
+			m.switchIndex = clickedIndex
 		}
 	}
 	return m, nil
