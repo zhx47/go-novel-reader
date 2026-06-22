@@ -150,6 +150,9 @@ func AggregateSearchResults(keyword string, resultsBySource map[int][]*SearchRes
 
 	// 转为切片
 	for _, agg := range aggregateMap {
+		sort.Slice(agg.Sources, func(i, j int) bool {
+			return agg.Sources[i].SourceID < agg.Sources[j].SourceID
+		})
 		aggregated.Results = append(aggregated.Results, agg)
 	}
 
@@ -191,10 +194,26 @@ func (asr *AggregatedSearchResult) ToBookRecord() *BookRecord {
 		return nil
 	}
 
-	record := NewBookRecord(firstSource.SearchResult, firstSource.SourceName)
+	return asr.ToBookRecordWithSource(firstSource.SourceID)
+}
+
+// ToBookRecordWithSource 转换为书籍记录，并指定当前书源
+func (asr *AggregatedSearchResult) ToBookRecordWithSource(sourceID int) *BookRecord {
+	selectedSource := asr.GetSourceByID(sourceID)
+	if selectedSource == nil {
+		selectedSource = asr.GetFirstSource()
+	}
+	if selectedSource == nil {
+		return nil
+	}
+
+	record := NewBookRecord(selectedSource.SearchResult, selectedSource.SourceName)
 
 	// 添加其他书源
-	for _, src := range asr.Sources[1:] {
+	for _, src := range asr.Sources {
+		if src.SourceID == selectedSource.SourceID {
+			continue
+		}
 		record.AddSource(&BookSource{
 			SourceID:      src.SourceID,
 			SourceName:    src.SourceName,
@@ -204,6 +223,7 @@ func (asr *AggregatedSearchResult) ToBookRecord() *BookRecord {
 			IsAvailable:   true,
 		})
 	}
+	record.CurrentSourceID = selectedSource.SourceID
 
 	// 使用聚合后的更完整信息
 	if asr.Intro != "" {

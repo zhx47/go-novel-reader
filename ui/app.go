@@ -1,10 +1,8 @@
 package ui
 
 import (
-	"context"
 	"fmt"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/charmbracelet/bubbles/textinput"
@@ -70,9 +68,14 @@ type Model struct {
 	keyword     string
 
 	// === 多源搜索 ===
-	aggregatedResults *model.MultiSourceSearchResult
-	resultIndex       int
-	searchProgress    map[int]*model.SourceSearchStat
+	aggregatedResults     *model.MultiSourceSearchResult
+	resultIndex           int
+	sourceIndex           int
+	searchID              int
+	searching             bool
+	searchStartedAt       time.Time
+	searchProgress        map[int]*model.SourceSearchStat
+	searchResultsBySource map[int][]*model.SearchResultWithSource
 
 	// === 单源搜索（兼容旧模式） ===
 	searchResults []*model.SearchResult
@@ -87,10 +90,12 @@ type Model struct {
 	tocOffset    int
 
 	// === 阅读 ===
-	currentChapter *model.Chapter
-	contentLines   []string
-	lineOffset     int
-	linesPerPage   int
+	currentChapter        *model.Chapter
+	contentLines          []string
+	lineOffset            int
+	linesPerPage          int
+	readerFullscreen      bool
+	resetLineOffsetOnLoad bool
 
 	// === 换源 ===
 	availableSources []*model.BookSource
@@ -109,15 +114,16 @@ type Model struct {
 
 // 消息类型
 type (
-	rulesLoadedMsg          struct{ rules []*model.Rule }
-	bookshelfLoadedMsg      struct{ shelf *model.BookShelf }
-	searchResultMsg         struct{ results []*model.SearchResult }
-	multiSearchResultMsg    struct{ result *model.MultiSourceSearchResult }
-	searchProgressMsg       struct {
+	rulesLoadedMsg      struct{ rules []*model.Rule }
+	bookshelfLoadedMsg  struct{ shelf *model.BookShelf }
+	searchResultMsg     struct{ results []*model.SearchResult }
+	sourceSearchDoneMsg struct {
+		searchID   int
+		keyword    string
 		sourceID   int
 		sourceName string
-		status     model.SearchStatus
-		count      int
+		results    []*model.SearchResultWithSource
+		duration   time.Duration
 		err        error
 	}
 	tocLoadedMsg struct {
@@ -137,7 +143,7 @@ type (
 		latestChapter string
 		err           error
 	}
-	errorMsg      struct{ err error }
+	errorMsg struct{ err error }
 )
 
 // 主菜单选项
@@ -173,16 +179,17 @@ func NewModel(cfg *config.AppConfig) Model {
 	}
 
 	return Model{
-		state:          StateMainMenu,
-		config:         cfg,
-		store:          store,
-		sourceManager:  source.NewManagerWithConfig(cfg),
-		httpClient:     httpClient,
-		preloader:      preloader,
-		searchInput:    ti,
-		linesPerPage:   20,
-		searchProgress: make(map[int]*model.SourceSearchStat),
-		maxDebugLogs:   100,
+		state:                 StateMainMenu,
+		config:                cfg,
+		store:                 store,
+		sourceManager:         source.NewManagerWithConfig(cfg),
+		httpClient:            httpClient,
+		preloader:             preloader,
+		searchInput:           ti,
+		linesPerPage:          20,
+		searchProgress:        make(map[int]*model.SourceSearchStat),
+		searchResultsBySource: make(map[int][]*model.SearchResultWithSource),
+		maxDebugLogs:          100,
 	}
 }
 
@@ -205,6 +212,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.linesPerPage < 5 {
 			m.linesPerPage = 5
 		}
+		if m.state == StateReader {
+			m.clampReaderOffset()
+		}
 		return m, nil
 
 	case tea.KeyMsg:
@@ -218,6 +228,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return m.handleBack()
 		case "esc":
+			if m.state == StateReader && m.readerFullscreen {
+				m.readerFullscreen = false
+				m.clampReaderOffset()
+				return m, nil
+			}
 			return m.handleBack()
 		}
 
@@ -256,7 +271,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case searchResultMsg:
 		m.searchResults = msg.results
+		m.aggregatedResults = nil
 		m.resultIndex = 0
+		m.sourceIndex = 0
+		m.searching = false
 		m.loading = false
 		m.state = StateSearchResult
 		if len(m.searchResults) == 0 {
@@ -266,28 +284,38 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
-	case multiSearchResultMsg:
-		m.aggregatedResults = msg.result
-		m.resultIndex = 0
-		m.loading = false
-		m.state = StateSearchResult
-		if msg.result.TotalCount == 0 {
-			m.statusMsg = "未找到相关书籍"
-		} else {
-			m.statusMsg = fmt.Sprintf("找到 %d 本书籍 (来自 %d 个书源)",
-				msg.result.TotalCount, msg.result.GetSuccessfulSourceCount())
+	case sourceSearchDoneMsg:
+		if msg.searchID != m.searchID || msg.keyword != m.keyword {
+			return m, nil
 		}
-		return m, nil
 
-	case searchProgressMsg:
+		selectedKey := m.selectedAggregatedKey()
+		selectedSourceID := m.selectedAggregatedSourceID()
+		status := model.SearchStatusSuccess
+		if msg.err != nil {
+			status = model.SearchStatusFailed
+			delete(m.searchResultsBySource, msg.sourceID)
+		} else {
+			m.searchResultsBySource[msg.sourceID] = msg.results
+		}
 		m.searchProgress[msg.sourceID] = &model.SourceSearchStat{
 			SourceID:    msg.sourceID,
 			SourceName:  msg.sourceName,
-			Status:      msg.status,
-			ResultCount: msg.count,
+			Status:      status,
+			ResultCount: len(msg.results),
+			Duration:    msg.duration.Milliseconds(),
 		}
 		if msg.err != nil {
 			m.searchProgress[msg.sourceID].Error = msg.err.Error()
+		}
+		m.aggregatedResults = model.AggregateSearchResults(m.keyword, m.searchResultsBySource)
+		m.aggregatedResults.SourceStats = m.copySearchProgress()
+		m.aggregatedResults.StartTime = m.searchStartedAt
+		m.aggregatedResults.EndTime = time.Now()
+		m.searching = !m.isSearchComplete()
+		m.restoreSearchSelection(selectedKey, selectedSourceID)
+		if m.state == StateSearchResult || m.state == StateSearch {
+			m.updateSearchStatus()
 		}
 		return m, nil
 
@@ -399,7 +427,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 		// 恢复阅读位置
-		if m.fromBookshelf && m.currentBook != nil && m.store != nil {
+		if m.resetLineOffsetOnLoad {
+			m.lineOffset = 0
+			m.resetLineOffsetOnLoad = false
+		} else if m.fromBookshelf && m.currentBook != nil && m.store != nil {
 			progress, _ := m.store.GetReadingProgress(m.currentBook.ID)
 			if progress != nil && progress.ChapterIndex == m.chapterIndex {
 				m.lineOffset = progress.LineOffset
@@ -422,11 +453,22 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case bookAddedMsg:
 		if m.bookshelf != nil {
 			m.bookshelf.AddBook(msg.book)
+			if saved := m.bookshelf.FindBook(msg.book.BookName, msg.book.Author); saved != nil {
+				saved.SwitchSource(msg.book.CurrentSourceID)
+			}
 			if m.store != nil {
 				m.store.SaveBookShelf(m.bookshelf)
 			}
 		}
-		m.statusMsg = fmt.Sprintf("已添加到书架: %s", msg.book.BookName)
+		sourceName := ""
+		if src := msg.book.GetCurrentSource(); src != nil {
+			sourceName = src.SourceName
+		}
+		if sourceName == "" {
+			m.statusMsg = fmt.Sprintf("已添加到书架: %s", msg.book.BookName)
+		} else {
+			m.statusMsg = fmt.Sprintf("已添加到书架: %s (%s)", msg.book.BookName, sourceName)
+		}
 		return m, nil
 
 	case updateCheckMsg:
@@ -499,9 +541,11 @@ func (m Model) handleBack() (tea.Model, tea.Cmd) {
 			m.state = StateBookShelf
 		} else {
 			m.state = StateSearchResult
+			m.updateSearchStatus()
 		}
 	case StateReader:
 		// 先改变状态，再保存进度（异步）
+		m.readerFullscreen = false
 		m.state = StateToc
 		cmd := m.saveProgress()
 		return m, cmd
@@ -541,53 +585,54 @@ func (m Model) loadBookshelf() tea.Cmd {
 }
 
 // doMultiSearch 执行多源搜索
-func (m Model) doMultiSearch() tea.Cmd {
+func (m Model) doMultiSearch(searchID int, keyword string) tea.Cmd {
+	if len(m.rules) == 0 {
+		return func() tea.Msg {
+			return errorMsg{fmt.Errorf("未找到可搜索书源")}
+		}
+	}
+
+	cmds := make([]tea.Cmd, 0, len(m.rules))
+	for _, rule := range m.rules {
+		r := rule
+		cmds = append(cmds, m.searchSource(searchID, keyword, r))
+	}
+	return tea.Batch(cmds...)
+}
+
+func (m Model) searchSource(searchID int, keyword string, rule *model.Rule) tea.Cmd {
 	return func() tea.Msg {
-		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-		defer cancel()
-
-		resultsBySource := make(map[int][]*model.SearchResultWithSource)
-		var mu sync.Mutex
-		var wg sync.WaitGroup
-
-		for _, rule := range m.rules {
-			wg.Add(1)
-			go func(r *model.Rule) {
-				defer wg.Done()
-
-				searchParser := parser.NewSearchParser(r, m.httpClient)
-				results, err := searchParser.Parse(m.keyword)
-
-				mu.Lock()
-				defer mu.Unlock()
-
-				if err != nil {
-					return
-				}
-
-				for _, result := range results {
-					result.SourceID = r.ID
-					resultsBySource[r.ID] = append(resultsBySource[r.ID], &model.SearchResultWithSource{
-						SearchResult: result,
-						SourceName:   r.Name,
-					})
-				}
-			}(rule)
+		startedAt := time.Now()
+		searchParser := parser.NewSearchParser(rule, m.httpClient)
+		results, err := searchParser.Parse(keyword)
+		if err != nil {
+			return sourceSearchDoneMsg{
+				searchID:   searchID,
+				keyword:    keyword,
+				sourceID:   rule.ID,
+				sourceName: rule.Name,
+				duration:   time.Since(startedAt),
+				err:        err,
+			}
 		}
 
-		// 等待所有搜索完成或超时
-		done := make(chan struct{})
-		go func() {
-			wg.Wait()
-			close(done)
-		}()
-
-		select {
-		case <-done:
-		case <-ctx.Done():
+		sourceResults := make([]*model.SearchResultWithSource, 0, len(results))
+		for _, result := range results {
+			result.SourceID = rule.ID
+			sourceResults = append(sourceResults, &model.SearchResultWithSource{
+				SearchResult: result,
+				SourceName:   rule.Name,
+			})
 		}
 
-		return multiSearchResultMsg{model.AggregateSearchResults(m.keyword, resultsBySource)}
+		return sourceSearchDoneMsg{
+			searchID:   searchID,
+			keyword:    keyword,
+			sourceID:   rule.ID,
+			sourceName: rule.Name,
+			results:    sourceResults,
+			duration:   time.Since(startedAt),
+		}
 	}
 }
 
@@ -758,7 +803,11 @@ func (m Model) addToBookshelf() tea.Cmd {
 
 		if m.aggregatedResults != nil && m.resultIndex < len(m.aggregatedResults.Results) {
 			agg := m.aggregatedResults.Results[m.resultIndex]
-			book = agg.ToBookRecord()
+			if src := m.selectedAggregatedSource(); src != nil {
+				book = agg.ToBookRecordWithSource(src.SourceID)
+			} else {
+				book = agg.ToBookRecord()
+			}
 		} else if m.selectedBook != nil {
 			sourceName := ""
 			if m.currentRule != nil {
@@ -952,13 +1001,36 @@ func (m Model) updateBookShelf(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 func (m Model) updateSearch(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "enter":
-		m.keyword = m.searchInput.Value()
+		m.keyword = strings.TrimSpace(m.searchInput.Value())
 		if m.keyword != "" {
-			m.loading = true
-			m.statusMsg = "搜索中..."
-			m.searchProgress = make(map[int]*model.SourceSearchStat)
+			if len(m.rules) == 0 {
+				m.statusMsg = "未找到可搜索书源"
+				return m, nil
+			}
+			m.searchID++
+			m.searching = true
+			m.searchStartedAt = time.Now()
+			m.resultIndex = 0
+			m.sourceIndex = 0
+			m.currentBook = nil
+			m.selectedBook = nil
+			m.searchResults = nil
+			m.searchProgress = make(map[int]*model.SourceSearchStat, len(m.rules))
+			m.searchResultsBySource = make(map[int][]*model.SearchResultWithSource)
+			for _, r := range m.rules {
+				m.searchProgress[r.ID] = &model.SourceSearchStat{
+					SourceID:   r.ID,
+					SourceName: r.Name,
+					Status:     model.SearchStatusRunning,
+				}
+			}
+			m.aggregatedResults = model.NewMultiSourceSearchResult(m.keyword)
+			m.aggregatedResults.SourceStats = m.copySearchProgress()
+			m.state = StateSearchResult
+			m.loading = false
+			m.updateSearchStatus()
 			// 使用多源搜索
-			return m, m.doMultiSearch()
+			return m, m.doMultiSearch(m.searchID, m.keyword)
 		}
 	default:
 		var cmd tea.Cmd
@@ -980,23 +1052,33 @@ func (m Model) updateSearchResult(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "up", "k":
 		if m.resultIndex > 0 {
 			m.resultIndex--
+			m.sourceIndex = 0
 		}
 	case "down", "j":
 		if m.resultIndex < resultCount-1 {
 			m.resultIndex++
+			m.sourceIndex = 0
+		}
+	case "left", "h":
+		if m.sourceIndex > 0 {
+			m.sourceIndex--
+		}
+	case "right", "l", "tab":
+		if m.sourceIndex < m.selectedAggregatedSourceCount()-1 {
+			m.sourceIndex++
 		}
 	case "enter":
 		if resultCount > 0 {
 			if m.aggregatedResults != nil {
 				agg := m.aggregatedResults.Results[m.resultIndex]
-				firstSource := agg.GetFirstSource()
-				if firstSource != nil {
+				selectedSource := m.selectedAggregatedSource()
+				if selectedSource != nil {
 					// 创建书籍记录
-					m.currentBook = agg.ToBookRecord()
-					m.selectedBook = firstSource.SearchResult
+					m.currentBook = agg.ToBookRecordWithSource(selectedSource.SourceID)
+					m.selectedBook = selectedSource.SearchResult
 					// 设置当前规则
 					for _, r := range m.rules {
-						if r.ID == firstSource.SourceID {
+						if r.ID == selectedSource.SourceID {
 							m.currentRule = r
 							break
 						}
@@ -1111,23 +1193,27 @@ func (m Model) updateToc(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 }
 
 func (m Model) updateReader(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	pageLines := m.readerContentLineCount()
 	switch msg.String() {
+	case "f11":
+		m.readerFullscreen = !m.readerFullscreen
+		m.clampReaderOffset()
 	case "up", "k":
 		if m.lineOffset > 0 {
 			m.lineOffset--
 		}
 	case "down", "j", " ":
-		if m.lineOffset < len(m.contentLines)-m.linesPerPage {
+		if m.lineOffset < len(m.contentLines)-pageLines {
 			m.lineOffset++
 		}
 	case "pgup":
-		m.lineOffset -= m.linesPerPage
+		m.lineOffset -= pageLines
 		if m.lineOffset < 0 {
 			m.lineOffset = 0
 		}
 	case "pgdown":
-		m.lineOffset += m.linesPerPage
-		maxOffset := len(m.contentLines) - m.linesPerPage
+		m.lineOffset += pageLines
+		maxOffset := len(m.contentLines) - pageLines
 		if maxOffset < 0 {
 			maxOffset = 0
 		}
@@ -1137,35 +1223,43 @@ func (m Model) updateReader(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "home", "g":
 		m.lineOffset = 0
 	case "end", "G":
-		m.lineOffset = len(m.contentLines) - m.linesPerPage
+		m.lineOffset = len(m.contentLines) - pageLines
 		if m.lineOffset < 0 {
 			m.lineOffset = 0
 		}
 	case "n", "right", "l":
 		// 下一章
 		if m.chapterIndex < len(m.chapters)-1 {
+			saveCmd := m.saveProgress()
 			m.chapterIndex++
+			m.lineOffset = 0
+			m.resetLineOffsetOnLoad = true
 			m.loading = true
 			m.statusMsg = "加载下一章..."
 			// 同时保存进度和加载下一章
-			return m, tea.Batch(m.saveProgress(), m.loadChapter(m.chapterIndex))
+			return m, tea.Batch(saveCmd, m.loadChapter(m.chapterIndex))
 		}
 	case "p", "left", "h":
 		// 上一章
 		if m.chapterIndex > 0 {
+			saveCmd := m.saveProgress()
 			m.chapterIndex--
+			m.lineOffset = 0
+			m.resetLineOffsetOnLoad = true
 			m.loading = true
 			m.statusMsg = "加载上一章..."
 			// 同时保存进度和加载上一章
-			return m, tea.Batch(m.saveProgress(), m.loadChapter(m.chapterIndex))
+			return m, tea.Batch(saveCmd, m.loadChapter(m.chapterIndex))
 		}
 	case "t":
 		// 返回目录
+		m.readerFullscreen = false
 		m.state = StateToc
 		return m, m.saveProgress()
 	case "c":
 		// 切换书源
 		if m.currentBook != nil && len(m.currentBook.Sources) > 1 {
+			m.readerFullscreen = false
 			m.availableSources = m.currentBook.Sources
 			m.switchIndex = 0
 			for i, s := range m.availableSources {
@@ -1326,7 +1420,7 @@ func (m Model) handleScrollDown() (tea.Model, tea.Cmd) {
 			}
 		}
 	case StateReader:
-		maxOffset := len(m.contentLines) - m.linesPerPage
+		maxOffset := len(m.contentLines) - m.readerContentLineCount()
 		if maxOffset < 0 {
 			maxOffset = 0
 		}
@@ -1392,21 +1486,33 @@ func (m Model) handleClick(x, y int) (tea.Model, tea.Cmd) {
 		if resultCount == 0 {
 			return m, nil
 		}
-		visibleItems := m.height - 14
-		if visibleItems < 3 {
-			visibleItems = 3
+
+		visibleItems := m.searchVisibleItems()
+		itemStartY := contentStartY + 1
+		leftWidth, _, stacked := m.searchColumnWidths()
+		if m.aggregatedResults != nil && !stacked && x >= leftWidth+4 {
+			selected := m.selectedAggregatedResult()
+			if selected == nil || len(selected.Sources) == 0 {
+				return m, nil
+			}
+			sourceIndex := clampIndex(m.sourceIndex, len(selected.Sources))
+			start, _ := visibleWindow(sourceIndex, len(selected.Sources), visibleItems)
+			clickedSourceIndex := y - itemStartY + start
+			if clickedSourceIndex >= 0 && clickedSourceIndex < len(selected.Sources) {
+				m.sourceIndex = clickedSourceIndex
+			}
+			return m, nil
 		}
-		start := 0
-		if m.resultIndex >= visibleItems {
-			start = m.resultIndex - visibleItems + 1
-		}
-		clickedIndex := y - contentStartY + start
+
+		start, _ := visibleWindow(m.resultIndex, resultCount, visibleItems)
+		clickedIndex := y - itemStartY + start
 		if clickedIndex >= 0 && clickedIndex < resultCount {
 			if m.resultIndex == clickedIndex {
 				// 点击已选中项，进入
 				return m.updateSearchResult(tea.KeyMsg{Type: tea.KeyEnter})
 			}
 			m.resultIndex = clickedIndex
+			m.sourceIndex = 0
 		}
 
 	case StateToc:
@@ -1571,117 +1677,152 @@ func (m Model) renderSearchResult() string {
 	b.WriteString(formatSubtitle(m.statusMsg))
 	b.WriteString("\n\n")
 
-	// 使用聚合结果
 	if m.aggregatedResults != nil {
-		if len(m.aggregatedResults.Results) == 0 {
-			b.WriteString(formatError("未找到相关书籍"))
-		} else {
-			// 计算可见行数，需要为选中项的详情预留空间
-			visibleItems := m.height - 14
-			if visibleItems < 3 {
-				visibleItems = 3
-			}
-
-			start := 0
-			end := len(m.aggregatedResults.Results)
-			if end > visibleItems {
-				if m.resultIndex >= visibleItems {
-					start = m.resultIndex - visibleItems + 1
-				}
-				end = start + visibleItems
-				if end > len(m.aggregatedResults.Results) {
-					end = len(m.aggregatedResults.Results)
-				}
-			}
-
-			for i := start; i < end; i++ {
-				result := m.aggregatedResults.Results[i]
-				line := fmt.Sprintf("%s - %s", result.BookName, result.Author)
-				if result.SourceCount > 1 {
-					line += fmt.Sprintf(" [%d源]", result.SourceCount)
-				}
-				// 显示最新章节（如果有）
-				if result.LatestChapter != "" {
-					// 截断过长的章节名
-					chapter := result.LatestChapter
-					if len([]rune(chapter)) > 20 {
-						chapter = string([]rune(chapter)[:20]) + "..."
-					}
-					line += fmt.Sprintf(" | %s", chapter)
-				}
-				if i == m.resultIndex {
-					b.WriteString(formatSelectedItem(line))
-				} else {
-					b.WriteString(formatItem(" " + line))
-				}
-				b.WriteString("\n")
-			}
-
-			// 显示选中书籍的各书源详情
-			if m.resultIndex < len(m.aggregatedResults.Results) {
-				selected := m.aggregatedResults.Results[m.resultIndex]
-				if len(selected.Sources) > 0 {
-					b.WriteString("\n")
-					b.WriteString(formatSubtitle("  📚 各书源最新章节:"))
-					b.WriteString("\n")
-					for _, src := range selected.Sources {
-						srcLine := fmt.Sprintf("    • %s", src.SourceName)
-						if src.LatestChapter != "" {
-							srcLine += fmt.Sprintf(": %s", src.LatestChapter)
-						}
-						if src.LastUpdateTime != "" {
-							srcLine += fmt.Sprintf(" (%s)", src.LastUpdateTime)
-						}
-						b.WriteString(formatItem(srcLine))
-						b.WriteString("\n")
-					}
-				}
-			}
-		}
+		b.WriteString(m.renderAggregatedSearchResults())
 	} else if len(m.searchResults) == 0 {
 		b.WriteString(formatError("未找到相关书籍"))
 	} else {
-		// 兼容单源搜索结果
-		visibleItems := m.height - 10
-		if visibleItems < 5 {
-			visibleItems = 5
-		}
-
-		start := 0
-		end := len(m.searchResults)
-		if end > visibleItems {
-			if m.resultIndex >= visibleItems {
-				start = m.resultIndex - visibleItems + 1
-			}
-			end = start + visibleItems
-			if end > len(m.searchResults) {
-				end = len(m.searchResults)
-			}
-		}
-
-		for i := start; i < end; i++ {
-			result := m.searchResults[i]
-			line := fmt.Sprintf("%s - %s", result.BookName, result.Author)
-			if result.LatestChapter != "" {
-				chapter := result.LatestChapter
-				if len([]rune(chapter)) > 20 {
-					chapter = string([]rune(chapter)[:20]) + "..."
-				}
-				line += fmt.Sprintf(" | %s", chapter)
-			}
-			if i == m.resultIndex {
-				b.WriteString(formatSelectedItem(line))
-			} else {
-				b.WriteString(formatItem(" " + line))
-			}
-			b.WriteString("\n")
-		}
+		b.WriteString(m.renderLegacySearchResults())
 	}
 
 	b.WriteString("\n")
-	b.WriteString(formatHelp("↑/↓: 选择  Enter: 查看目录  a: 加入书架  Esc: 返回"))
+	b.WriteString(formatHelp("↑/↓: 选择小说  ←/→: 选择书源  Enter: 查看目录  a: 用当前源加入书架  Esc: 返回"))
 
 	return contentStyle.Render(b.String())
+}
+
+func (m Model) renderAggregatedSearchResults() string {
+	leftWidth, rightWidth, stacked := m.searchColumnWidths()
+	visibleItems := m.searchVisibleItems()
+	results := m.aggregatedResults.Results
+
+	var left strings.Builder
+	left.WriteString(formatSubtitle("小说"))
+	left.WriteString("\n")
+	if len(results) == 0 {
+		if m.searching {
+			left.WriteString(formatLoading("搜索中，等待书源返回结果..."))
+		} else {
+			left.WriteString(formatError("未找到相关书籍"))
+		}
+		left.WriteString("\n")
+	} else {
+		start, end := visibleWindow(m.resultIndex, len(results), visibleItems)
+		for i := start; i < end; i++ {
+			result := results[i]
+			line := fmt.Sprintf("%s - %s", result.BookName, result.Author)
+			if result.SourceCount > 1 {
+				line += fmt.Sprintf(" [%d源]", result.SourceCount)
+			}
+			if result.LatestChapter != "" {
+				line += fmt.Sprintf(" | %s", result.LatestChapter)
+			}
+			line = truncateDisplay(line, leftWidth-4)
+			if i == m.resultIndex {
+				left.WriteString(formatSelectedItem(line))
+			} else {
+				left.WriteString(formatItem(" " + line))
+			}
+			left.WriteString("\n")
+		}
+	}
+
+	var right strings.Builder
+	selected := m.selectedAggregatedResult()
+	if selected == nil {
+		right.WriteString(formatSubtitle("书源进度"))
+		right.WriteString("\n")
+		right.WriteString(m.renderSearchProgressList(visibleItems, rightWidth))
+	} else {
+		right.WriteString(formatSubtitle(truncateDisplay(fmt.Sprintf("书源: %s", selected.BookName), rightWidth-2)))
+		right.WriteString("\n")
+		if len(selected.Sources) == 0 {
+			right.WriteString(formatError("当前小说暂无可用书源"))
+			right.WriteString("\n")
+		} else {
+			sourceIndex := clampIndex(m.sourceIndex, len(selected.Sources))
+			start, end := visibleWindow(sourceIndex, len(selected.Sources), visibleItems)
+			for i := start; i < end; i++ {
+				src := selected.Sources[i]
+				line := src.SourceName
+				if src.LatestChapter != "" {
+					line += fmt.Sprintf(" | %s", src.LatestChapter)
+				}
+				if src.LastUpdateTime != "" {
+					line += fmt.Sprintf(" (%s)", src.LastUpdateTime)
+				}
+				line = truncateDisplay(line, rightWidth-4)
+				if i == sourceIndex {
+					right.WriteString(formatSelectedItem(line))
+				} else {
+					right.WriteString(formatItem(" " + line))
+				}
+				right.WriteString("\n")
+			}
+			if m.searching {
+				right.WriteString("\n")
+				right.WriteString(formatLoading("搜索中，后续书源会继续合并"))
+				right.WriteString("\n")
+			}
+		}
+	}
+
+	if stacked {
+		return left.String() + "\n" + right.String()
+	}
+
+	leftPane := lipgloss.NewStyle().Width(leftWidth).Render(left.String())
+	rightPane := lipgloss.NewStyle().Width(rightWidth).PaddingLeft(2).Render(right.String())
+	return lipgloss.JoinHorizontal(lipgloss.Top, leftPane, rightPane)
+}
+
+func (m Model) renderLegacySearchResults() string {
+	var b strings.Builder
+
+	visibleItems := m.searchVisibleItems()
+	start, end := visibleWindow(m.resultIndex, len(m.searchResults), visibleItems)
+	for i := start; i < end; i++ {
+		result := m.searchResults[i]
+		line := fmt.Sprintf("%s - %s", result.BookName, result.Author)
+		if result.LatestChapter != "" {
+			line += fmt.Sprintf(" | %s", result.LatestChapter)
+		}
+		line = truncateDisplay(line, m.width-8)
+		if i == m.resultIndex {
+			b.WriteString(formatSelectedItem(line))
+		} else {
+			b.WriteString(formatItem(" " + line))
+		}
+		b.WriteString("\n")
+	}
+
+	return b.String()
+}
+
+func (m Model) renderSearchProgressList(limit int, width int) string {
+	var b strings.Builder
+	count := 0
+	for _, rule := range m.rules {
+		if count >= limit {
+			break
+		}
+		stat := m.searchProgress[rule.ID]
+		status := model.SearchStatusRunning
+		resultCount := 0
+		if stat != nil {
+			status = stat.Status
+			resultCount = stat.ResultCount
+		}
+		line := fmt.Sprintf("%s: %s", rule.Name, status.String())
+		if resultCount > 0 {
+			line += fmt.Sprintf("，%d 条", resultCount)
+		}
+		line = truncateDisplay(line, width-4)
+		b.WriteString(formatItem(" " + line))
+		b.WriteString("\n")
+		count++
+	}
+	return b.String()
 }
 
 func (m Model) renderToc() string {
@@ -1759,21 +1900,12 @@ func (m Model) renderToc() string {
 func (m Model) renderReader() string {
 	var b strings.Builder
 
-	// 章节标题
-	if m.currentChapter != nil {
+	if !m.readerFullscreen && m.currentChapter != nil {
 		b.WriteString(formatChapterTitle(m.currentChapter.Title))
 		b.WriteString("\n\n")
 	}
 
-	// 计算可用于内容的行数
-	contentLinesAvailable := m.linesPerPage
-	if m.showDebugLog {
-		// 调试日志占用一部分空间
-		contentLinesAvailable = m.linesPerPage / 2
-		if contentLinesAvailable < 5 {
-			contentLinesAvailable = 5
-		}
-	}
+	contentLinesAvailable := m.readerContentLineCount()
 
 	// 章节内容
 	if len(m.contentLines) == 0 {
@@ -1788,6 +1920,10 @@ func (m Model) renderReader() string {
 			b.WriteString(m.contentLines[i])
 			b.WriteString("\n")
 		}
+	}
+
+	if m.readerFullscreen {
+		return contentStyle.Render(b.String())
 	}
 
 	// 调试日志区域
@@ -1881,7 +2017,10 @@ func (m Model) renderReader() string {
 	}
 
 	// 进度信息
-	progress := float64(m.lineOffset+contentLinesAvailable) / float64(len(m.contentLines)) * 100
+	progress := 0.0
+	if len(m.contentLines) > 0 {
+		progress = float64(m.lineOffset+contentLinesAvailable) / float64(len(m.contentLines)) * 100
+	}
 	if progress > 100 {
 		progress = 100
 	}
@@ -1890,7 +2029,7 @@ func (m Model) renderReader() string {
 
 	b.WriteString("\n")
 
-	helpText := "j/k: 滚动  n/p: 上下章  t: 目录"
+	helpText := "j/k: 滚动  n/p: 上下章  t: 目录  F11: 沉浸"
 	if m.currentBook != nil && len(m.currentBook.Sources) > 1 {
 		helpText += "  c: 换源"
 	}
@@ -1951,6 +2090,274 @@ func (m Model) getBookshelfBooks() []*model.BookRecord {
 		return nil
 	}
 	return m.bookshelf.GetBooksSortedByLastRead()
+}
+
+func (m Model) readerContentLineCount() int {
+	if m.readerFullscreen {
+		lines := m.height - 2
+		if lines < 5 {
+			lines = m.linesPerPage
+		}
+		if lines < 5 {
+			lines = 5
+		}
+		return lines
+	}
+
+	lines := m.linesPerPage
+	if m.showDebugLog {
+		lines = m.linesPerPage / 2
+		if lines < 5 {
+			lines = 5
+		}
+	}
+	return lines
+}
+
+func (m Model) readerMaxLineOffset() int {
+	maxOffset := len(m.contentLines) - m.readerContentLineCount()
+	if maxOffset < 0 {
+		return 0
+	}
+	return maxOffset
+}
+
+func (m *Model) clampReaderOffset() {
+	maxOffset := m.readerMaxLineOffset()
+	if m.lineOffset > maxOffset {
+		m.lineOffset = maxOffset
+	}
+	if m.lineOffset < 0 {
+		m.lineOffset = 0
+	}
+}
+
+func (m Model) selectedAggregatedResult() *model.AggregatedSearchResult {
+	if m.aggregatedResults == nil || len(m.aggregatedResults.Results) == 0 {
+		return nil
+	}
+	return m.aggregatedResults.Results[clampIndex(m.resultIndex, len(m.aggregatedResults.Results))]
+}
+
+func (m Model) selectedAggregatedSource() *model.SearchResultWithSource {
+	selected := m.selectedAggregatedResult()
+	if selected == nil || len(selected.Sources) == 0 {
+		return nil
+	}
+	return selected.Sources[clampIndex(m.sourceIndex, len(selected.Sources))]
+}
+
+func (m Model) selectedAggregatedSourceCount() int {
+	selected := m.selectedAggregatedResult()
+	if selected == nil {
+		return 0
+	}
+	return len(selected.Sources)
+}
+
+func (m Model) selectedAggregatedKey() string {
+	selected := m.selectedAggregatedResult()
+	if selected == nil {
+		return ""
+	}
+	return selected.NormalizedKey
+}
+
+func (m Model) selectedAggregatedSourceID() int {
+	selected := m.selectedAggregatedSource()
+	if selected == nil {
+		return 0
+	}
+	return selected.SourceID
+}
+
+func (m *Model) restoreSearchSelection(selectedKey string, selectedSourceID int) {
+	if m.aggregatedResults == nil || len(m.aggregatedResults.Results) == 0 {
+		m.resultIndex = 0
+		m.sourceIndex = 0
+		return
+	}
+
+	if selectedKey != "" {
+		for i, result := range m.aggregatedResults.Results {
+			if result.NormalizedKey == selectedKey {
+				m.resultIndex = i
+				break
+			}
+		}
+	}
+	m.resultIndex = clampIndex(m.resultIndex, len(m.aggregatedResults.Results))
+
+	selected := m.aggregatedResults.Results[m.resultIndex]
+	if selectedSourceID != 0 {
+		for i, src := range selected.Sources {
+			if src.SourceID == selectedSourceID {
+				m.sourceIndex = i
+				return
+			}
+		}
+	}
+	m.sourceIndex = clampIndex(m.sourceIndex, len(selected.Sources))
+}
+
+func (m Model) copySearchProgress() map[int]*model.SourceSearchStat {
+	copied := make(map[int]*model.SourceSearchStat, len(m.searchProgress))
+	for sourceID, stat := range m.searchProgress {
+		if stat == nil {
+			continue
+		}
+		value := *stat
+		copied[sourceID] = &value
+	}
+	return copied
+}
+
+func (m Model) isSearchComplete() bool {
+	total := m.searchSourceTotal()
+	return total > 0 && m.completedSearchSourceCount() >= total
+}
+
+func (m Model) searchSourceTotal() int {
+	if len(m.searchProgress) > 0 {
+		return len(m.searchProgress)
+	}
+	return len(m.rules)
+}
+
+func (m Model) completedSearchSourceCount() int {
+	count := 0
+	for _, stat := range m.searchProgress {
+		if stat != nil && isFinalSearchStatus(stat.Status) {
+			count++
+		}
+	}
+	return count
+}
+
+func (m Model) resultSourceCount() int {
+	count := 0
+	for _, results := range m.searchResultsBySource {
+		if len(results) > 0 {
+			count++
+		}
+	}
+	return count
+}
+
+func isFinalSearchStatus(status model.SearchStatus) bool {
+	return status == model.SearchStatusSuccess ||
+		status == model.SearchStatusFailed ||
+		status == model.SearchStatusTimeout
+}
+
+func (m *Model) updateSearchStatus() {
+	m.statusMsg = m.searchStatusText()
+}
+
+func (m Model) searchStatusText() string {
+	total := m.searchSourceTotal()
+	if total == 0 {
+		return "未找到可搜索书源"
+	}
+
+	done := m.completedSearchSourceCount()
+	found := 0
+	if m.aggregatedResults != nil {
+		found = m.aggregatedResults.TotalCount
+	}
+
+	if m.searching {
+		if found == 0 {
+			return fmt.Sprintf("搜索中... %d/%d 个书源完成", done, total)
+		}
+		return fmt.Sprintf("已找到 %d 本，搜索中... %d/%d 个书源完成", found, done, total)
+	}
+
+	if found == 0 {
+		return fmt.Sprintf("未找到相关书籍 (已搜索 %d 个书源)", done)
+	}
+	return fmt.Sprintf("找到 %d 本书籍 (来自 %d 个书源)", found, m.resultSourceCount())
+}
+
+func (m Model) searchColumnWidths() (int, int, bool) {
+	contentWidth := m.width - 4
+	if contentWidth <= 0 {
+		contentWidth = 80
+	}
+	if contentWidth < 64 {
+		return contentWidth, contentWidth, true
+	}
+
+	gap := 2
+	leftWidth := contentWidth * 45 / 100
+	if leftWidth < 30 {
+		leftWidth = 30
+	}
+	rightWidth := contentWidth - leftWidth - gap
+	if rightWidth < 30 {
+		rightWidth = 30
+		leftWidth = contentWidth - rightWidth - gap
+	}
+	if leftWidth < 24 {
+		return contentWidth, contentWidth, true
+	}
+	return leftWidth, rightWidth, false
+}
+
+func (m Model) searchVisibleItems() int {
+	visibleItems := m.height - 12
+	if visibleItems < 4 {
+		visibleItems = 4
+	}
+	return visibleItems
+}
+
+func visibleWindow(index int, count int, visibleItems int) (int, int) {
+	if count <= 0 {
+		return 0, 0
+	}
+	if visibleItems <= 0 || visibleItems > count {
+		visibleItems = count
+	}
+
+	index = clampIndex(index, count)
+	start := 0
+	if index >= visibleItems {
+		start = index - visibleItems + 1
+	}
+	if start+visibleItems > count {
+		start = count - visibleItems
+	}
+	if start < 0 {
+		start = 0
+	}
+	return start, start + visibleItems
+}
+
+func clampIndex(index int, count int) int {
+	if count <= 0 {
+		return 0
+	}
+	if index < 0 {
+		return 0
+	}
+	if index >= count {
+		return count - 1
+	}
+	return index
+}
+
+func truncateDisplay(s string, width int) string {
+	if width <= 0 {
+		return ""
+	}
+	if runewidth.StringWidth(s) <= width {
+		return s
+	}
+	if width <= 3 {
+		return runewidth.Truncate(s, width, "")
+	}
+	return runewidth.Truncate(s, width, "...")
 }
 
 // addDebugLog 添加调试日志
