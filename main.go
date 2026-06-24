@@ -4,8 +4,6 @@ import (
 	"fmt"
 	"os"
 
-	tea "github.com/charmbracelet/bubbletea"
-
 	"go-novel-reader/config"
 	"go-novel-reader/ui"
 )
@@ -20,11 +18,10 @@ func main() {
 	}
 
 	// 创建应用
-	model := ui.NewModel(cfg)
+	app := ui.NewApp(cfg)
 
 	// 启动程序
-	p := tea.NewProgram(model, tea.WithAltScreen(), tea.WithMouseAllMotion())
-	if _, err := p.Run(); err != nil {
+	if err := app.Run(); err != nil {
 		fmt.Printf("启动失败: %v\n", err)
 		os.Exit(1)
 	}

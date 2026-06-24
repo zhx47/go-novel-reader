@@ -5,10 +5,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/charmbracelet/bubbles/textinput"
-	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
-	"github.com/mattn/go-runewidth"
+	"github.com/gdamore/tcell/v2"
+	"github.com/rivo/tview"
 
 	"go-novel-reader/config"
 	"go-novel-reader/httpclient"
@@ -19,55 +17,131 @@ import (
 	"go-novel-reader/storage"
 )
 
-// 应用状态
 type AppState int
 
 const (
-	StateMainMenu     AppState = iota // 主菜单
-	StateBookShelf                    // 书架
-	StateSearch                       // 搜索
-	StateSearchResult                 // 搜索结果
-	StateToc                          // 目录
-	StateReader                       // 阅读
-	StateSourceSwitch                 // 换源
+	StateMainMenu AppState = iota
+	StateBookShelf
+	StateSearch
+	StateSearchResult
+	StateToc
+	StateReader
+	StateSourceSwitch
 )
 
-// Model 应用模型
-type Model struct {
-	state  AppState
-	width  int
-	height int
+type sourcePanelMode int
 
-	// 配置
-	config *config.AppConfig
+const (
+	sourcePanelProgress sourcePanelMode = iota
+	sourcePanelSources
+)
 
-	// 存储
-	store storage.Store
+type statusLevel int
 
-	// 书源管理
+const (
+	statusInfo statusLevel = iota
+	statusSuccess
+	statusWarning
+	statusError
+)
+
+const (
+	pageMainMenu     = "main-menu"
+	pageBookShelf    = "bookshelf"
+	pageSearch       = "search"
+	pageSearchResult = "search-result"
+	pageToc          = "toc"
+	pageReader       = "reader"
+	pageSourceSwitch = "source-switch"
+	pageLoading      = "loading"
+)
+
+var (
+	colorPrimary = tcell.NewHexColor(0x7C3AED)
+	colorAccent  = tcell.NewHexColor(0x10B981)
+	colorWarning = tcell.NewHexColor(0xF59E0B)
+	colorError   = tcell.NewHexColor(0xEF4444)
+	colorMuted   = tcell.NewHexColor(0x94A3B8)
+)
+
+type sourceSearchDone struct {
+	searchID   int
+	keyword    string
+	sourceID   int
+	sourceName string
+	results    []*model.SearchResultWithSource
+	duration   time.Duration
+	err        error
+}
+
+type tocLoadResult struct {
+	chapters  []*model.Chapter
+	fromCache bool
+	err       error
+}
+
+type chapterLoadResult struct {
+	chapter   *model.Chapter
+	fromCache bool
+	err       error
+}
+
+type updateCheckResult struct {
+	bookID        string
+	hasUpdate     bool
+	newChapters   int
+	latestChapter string
+	err           error
+}
+
+type App struct {
+	app          *tview.Application
+	root         *tview.Flex
+	headerFlex   *tview.Flex
+	contentPages *tview.Pages
+
+	titleView    *tview.TextView
+	subtitleView *tview.TextView
+	statusView   *tview.TextView
+	helpView     *tview.TextView
+	loadingView  *tview.TextView
+
+	mainMenuList     *tview.List
+	bookshelfList    *tview.List
+	searchInput      *tview.InputField
+	searchLayout     *tview.Flex
+	searchResultList *tview.List
+	searchSourceList *tview.List
+	searchPreview    *tview.TextView
+	tocList          *tview.List
+	readerLayout     *tview.Flex
+	readerContent    *tview.TextView
+	debugView        *tview.TextView
+	sourceSwitchList *tview.List
+
+	state            AppState
+	width            int
+	height           int
+	showingLoading   bool
+	busy             bool
+	loadingTitle     string
+	loadingSubtitle  string
+	readerFullscreen bool
+	showDebugLog     bool
+
+	config        *config.AppConfig
+	store         storage.Store
 	sourceManager *source.Manager
 	rules         []*model.Rule
 	currentRule   *model.Rule
+	httpClient    *httpclient.Client
+	preloader     *service.ChapterPreloader
 
-	// HTTP客户端
-	httpClient *httpclient.Client
-
-	// 章节预加载器
-	preloader *service.ChapterPreloader
-
-	// === 主菜单 ===
-	menuIndex int
-
-	// === 书架 ===
 	bookshelf      *model.BookShelf
 	bookshelfIndex int
-	fromBookshelf  bool // 标记是否从书架进入
+	fromBookshelf  bool
 
-	// === 搜索 ===
-	searchInput textinput.Model
-	keyword     string
-
-	// === 多源搜索 ===
+	keyword               string
 	aggregatedResults     *model.MultiSourceSearchResult
 	resultIndex           int
 	sourceIndex           int
@@ -76,2197 +150,1183 @@ type Model struct {
 	searchStartedAt       time.Time
 	searchProgress        map[int]*model.SourceSearchStat
 	searchResultsBySource map[int][]*model.SearchResultWithSource
+	sourcePanelMode       sourcePanelMode
 
-	// === 单源搜索（兼容旧模式） ===
-	searchResults []*model.SearchResult
+	currentBook  *model.BookRecord
+	selectedBook *model.SearchResult
 
-	// === 当前书籍 ===
-	currentBook  *model.BookRecord   // 书架中的书籍记录
-	selectedBook *model.SearchResult // 搜索选中的书籍
-
-	// === 目录 ===
 	chapters     []*model.Chapter
 	chapterIndex int
-	tocOffset    int
 
-	// === 阅读 ===
-	currentChapter        *model.Chapter
-	contentLines          []string
-	lineOffset            int
-	linesPerPage          int
-	readerFullscreen      bool
-	resetLineOffsetOnLoad bool
-
-	// === 换源 ===
 	availableSources []*model.BookSource
 	switchIndex      int
 
-	// === 调试日志 ===
-	showDebugLog bool
+	currentChapter *model.Chapter
+
 	debugLogs    []string
 	maxDebugLogs int
 
-	// 状态
-	loading   bool
-	err       error
-	statusMsg string
+	statusMsg   string
+	statusLevel statusLevel
+	err         error
+
+	refreshingBookshelf    bool
+	refreshingResultList   bool
+	refreshingSourceList   bool
+	refreshingToc          bool
+	refreshingSourceSwitch bool
 }
 
-// 消息类型
-type (
-	rulesLoadedMsg      struct{ rules []*model.Rule }
-	bookshelfLoadedMsg  struct{ shelf *model.BookShelf }
-	searchResultMsg     struct{ results []*model.SearchResult }
-	sourceSearchDoneMsg struct {
-		searchID   int
-		keyword    string
-		sourceID   int
-		sourceName string
-		results    []*model.SearchResultWithSource
-		duration   time.Duration
-		err        error
+func NewApp(cfg *config.AppConfig) *App {
+	if cfg == nil {
+		cfg = config.DefaultConfig()
 	}
-	tocLoadedMsg struct {
-		chapters  []*model.Chapter
-		fromCache bool
-	}
-	chapterLoadedMsg struct {
-		chapter   *model.Chapter
-		fromCache bool
-	}
-	progressSavedMsg struct{}
-	bookAddedMsg     struct{ book *model.BookRecord }
-	updateCheckMsg   struct {
-		bookID        string
-		hasUpdate     bool
-		newChapters   int
-		latestChapter string
-		err           error
-	}
-	errorMsg struct{ err error }
-)
 
-// 主菜单选项
-var mainMenuItems = []string{
-	"📚 书架",
-	"🔍 搜索小说",
-}
-
-// NewModel 创建应用模型
-func NewModel(cfg *config.AppConfig) Model {
-	ti := textinput.New()
-	ti.Placeholder = "输入书名或作者..."
-	ti.CharLimit = 100
-	ti.Width = 40
-
-	// 创建存储（使用SQLite）
 	sqliteStore, err := storage.NewDefaultSQLiteStore()
 	if err != nil {
-		// 如果创建失败，使用空存储（打印警告但不阻止启动）
 		fmt.Printf("警告: 无法创建持久化存储: %v\n", err)
 	}
 
-	// 使用 Store 接口类型
 	var store storage.Store = sqliteStore
-
-	// 创建HTTP客户端
 	httpClient := httpclient.NewClient(cfg)
 
-	// 创建预加载器（SQLiteStore 实现了 CacheStore 接口）
 	var preloader *service.ChapterPreloader
 	if sqliteStore != nil {
 		preloader = service.NewChapterPreloader(sqliteStore, httpClient, 3)
 	}
 
-	return Model{
-		state:                 StateMainMenu,
+	app := &App{
+		app:                   tview.NewApplication(),
 		config:                cfg,
 		store:                 store,
 		sourceManager:         source.NewManagerWithConfig(cfg),
 		httpClient:            httpClient,
 		preloader:             preloader,
-		searchInput:           ti,
-		linesPerPage:          20,
+		bookshelf:             model.NewBookShelf(),
 		searchProgress:        make(map[int]*model.SourceSearchStat),
 		searchResultsBySource: make(map[int][]*model.SearchResultWithSource),
+		debugLogs:             make([]string, 0, 32),
 		maxDebugLogs:          100,
+		statusLevel:           statusInfo,
+	}
+
+	app.loadInitialData()
+	app.buildUI()
+	app.refreshAll()
+	app.switchState(StateMainMenu)
+	return app
+}
+
+func (a *App) Run() error {
+	a.app.SetTitle("go-novel-reader")
+	a.app.SetRoot(a.root, true)
+	a.app.EnableMouse(true)
+	a.app.SetInputCapture(a.captureGlobalInput)
+	a.app.SetBeforeDrawFunc(func(screen tcell.Screen) bool {
+		width, height := screen.Size()
+		if width != a.width || height != a.height {
+			a.width = width
+			a.height = height
+			a.handleResize()
+		}
+		return false
+	})
+	return a.app.Run()
+}
+
+func (a *App) loadInitialData() {
+	rules, err := a.sourceManager.GetSearchableRules(a.config.ActiveRules)
+	if err != nil {
+		a.setStatus(fmt.Sprintf("加载书源失败: %v", err), statusError)
+		a.addDebugLog("加载书源失败: %v", err)
+	} else {
+		a.rules = rules
+		if len(rules) > 0 {
+			a.currentRule = rules[0]
+		}
+	}
+
+	if a.store == nil {
+		return
+	}
+
+	shelf, err := a.store.LoadBookShelf()
+	if err != nil {
+		a.setStatus(fmt.Sprintf("加载书架失败: %v", err), statusError)
+		a.addDebugLog("加载书架失败: %v", err)
+		return
+	}
+	if shelf != nil {
+		a.bookshelf = shelf
 	}
 }
 
-// Init 初始化
-func (m Model) Init() tea.Cmd {
-	return tea.Batch(
-		m.loadRules(),
-		m.loadBookshelf(),
-		tea.WindowSize(),
-	)
-}
+func (a *App) captureGlobalInput(event *tcell.EventKey) *tcell.EventKey {
+	if event == nil {
+		return nil
+	}
 
-// Update 更新
-func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
-	switch msg := msg.(type) {
-	case tea.WindowSizeMsg:
-		m.width = msg.Width
-		m.height = msg.Height
-		m.linesPerPage = m.height - 8
-		if m.linesPerPage < 5 {
-			m.linesPerPage = 5
-		}
-		if m.state == StateReader {
-			m.clampReaderOffset()
-		}
-		return m, nil
+	if event.Key() == tcell.KeyCtrlC {
+		a.app.Stop()
+		return nil
+	}
 
-	case tea.KeyMsg:
-		// 全局快捷键
-		switch msg.String() {
-		case "ctrl+c":
-			return m, tea.Quit
-		case "q":
-			if m.state == StateMainMenu {
-				return m, tea.Quit
-			}
-			return m.handleBack()
-		case "esc":
-			if m.state == StateReader && m.readerFullscreen {
-				m.readerFullscreen = false
-				m.clampReaderOffset()
-				return m, nil
-			}
-			return m.handleBack()
-		}
+	if a.busy {
+		return nil
+	}
 
-		// 状态特定处理
-		switch m.state {
-		case StateMainMenu:
-			return m.updateMainMenu(msg)
-		case StateBookShelf:
-			return m.updateBookShelf(msg)
-		case StateSearch:
-			return m.updateSearch(msg)
-		case StateSearchResult:
-			return m.updateSearchResult(msg)
-		case StateToc:
-			return m.updateToc(msg)
-		case StateReader:
-			return m.updateReader(msg)
-		case StateSourceSwitch:
-			return m.updateSourceSwitch(msg)
-		}
+	focus := a.app.GetFocus()
+	if focus == a.searchInput {
+		return event
+	}
 
-	case tea.MouseMsg:
-		return m.handleMouse(msg)
+	if a.state == StateReader && a.readerFullscreen {
+		if event.Key() == tcell.KeyEsc {
+			a.readerFullscreen = false
+			a.refreshReaderLayout()
+			a.refreshChrome()
+			return nil
+		}
+		if event.Key() == tcell.KeyF11 {
+			a.toggleReaderFullscreen()
+			return nil
+		}
+	}
 
-	case rulesLoadedMsg:
-		m.rules = msg.rules
-		m.loading = false
-		if len(m.rules) > 0 {
-			m.currentRule = m.rules[0]
+	switch event.Key() {
+	case tcell.KeyEsc:
+		a.handleBack()
+		return nil
+	case tcell.KeyF11:
+		if a.state == StateReader {
+			a.toggleReaderFullscreen()
+			return nil
 		}
-		return m, nil
+	}
 
-	case bookshelfLoadedMsg:
-		m.bookshelf = msg.shelf
-		return m, nil
-
-	case searchResultMsg:
-		m.searchResults = msg.results
-		m.aggregatedResults = nil
-		m.resultIndex = 0
-		m.sourceIndex = 0
-		m.searching = false
-		m.loading = false
-		m.state = StateSearchResult
-		if len(m.searchResults) == 0 {
-			m.statusMsg = "未找到相关书籍"
-		} else {
-			m.statusMsg = fmt.Sprintf("找到 %d 本书籍", len(m.searchResults))
-		}
-		return m, nil
-
-	case sourceSearchDoneMsg:
-		if msg.searchID != m.searchID || msg.keyword != m.keyword {
-			return m, nil
-		}
-
-		selectedKey := m.selectedAggregatedKey()
-		selectedSourceID := m.selectedAggregatedSourceID()
-		status := model.SearchStatusSuccess
-		if msg.err != nil {
-			status = model.SearchStatusFailed
-			delete(m.searchResultsBySource, msg.sourceID)
-		} else {
-			m.searchResultsBySource[msg.sourceID] = msg.results
-		}
-		m.searchProgress[msg.sourceID] = &model.SourceSearchStat{
-			SourceID:    msg.sourceID,
-			SourceName:  msg.sourceName,
-			Status:      status,
-			ResultCount: len(msg.results),
-			Duration:    msg.duration.Milliseconds(),
-		}
-		if msg.err != nil {
-			m.searchProgress[msg.sourceID].Error = msg.err.Error()
-		}
-		m.aggregatedResults = model.AggregateSearchResults(m.keyword, m.searchResultsBySource)
-		m.aggregatedResults.SourceStats = m.copySearchProgress()
-		m.aggregatedResults.StartTime = m.searchStartedAt
-		m.aggregatedResults.EndTime = time.Now()
-		m.searching = !m.isSearchComplete()
-		m.restoreSearchSelection(selectedKey, selectedSourceID)
-		if m.state == StateSearchResult || m.state == StateSearch {
-			m.updateSearchStatus()
-		}
-		return m, nil
-
-	case tocLoadedMsg:
-		m.chapters = msg.chapters
-		m.loading = false
-		m.state = StateToc
-
-		// 确保 currentRule 与当前书源匹配
-		if m.currentBook != nil {
-			src := m.currentBook.GetCurrentSource()
-			if src != nil {
-				for _, r := range m.rules {
-					if r.ID == src.SourceID {
-						m.currentRule = r
-						break
-					}
-				}
-			}
-		}
-
-		// 添加调试日志
-		var bookURL string
-		if m.currentBook != nil {
-			src := m.currentBook.GetCurrentSource()
-			if src != nil {
-				bookURL = src.BookURL
-			}
-		} else if m.selectedBook != nil {
-			bookURL = m.selectedBook.URL
-		}
-		if msg.fromCache {
-			m.addDebugLog("目录加载成功 (缓存): %d 章", len(msg.chapters))
-		} else {
-			m.addDebugLog("目录加载成功: %d 章", len(msg.chapters))
-		}
-		m.addDebugLog("书籍URL: %s", bookURL)
-		if m.currentRule != nil {
-			m.addDebugLog("当前规则: %s (%s)", m.currentRule.Name, m.currentRule.URL)
-		}
-
-		// 如果从书架进入，恢复阅读进度
-		if m.fromBookshelf && m.currentBook != nil && m.store != nil {
-			progress, _ := m.store.GetReadingProgress(m.currentBook.ID)
-			if progress != nil {
-				m.chapterIndex = progress.ChapterIndex
-				if m.chapterIndex >= len(m.chapters) {
-					m.chapterIndex = len(m.chapters) - 1
-				}
-				// 计算 tocOffset
-				visibleItems := m.height - 10
-				if visibleItems < 5 {
-					visibleItems = 5
-				}
-				m.tocOffset = m.chapterIndex - visibleItems/2
-				if m.tocOffset < 0 {
-					m.tocOffset = 0
-				}
+	if event.Key() == tcell.KeyRune {
+		switch event.Rune() {
+		case 'q':
+			if a.state == StateMainMenu {
+				a.app.Stop()
 			} else {
-				m.chapterIndex = 0
-				m.tocOffset = 0
+				a.handleBack()
 			}
-		} else {
-			m.chapterIndex = 0
-			m.tocOffset = 0
-		}
-
-		m.statusMsg = fmt.Sprintf("共 %d 章", len(m.chapters))
-
-		// 更新书籍的章节数
-		if m.currentBook != nil {
-			m.currentBook.TotalChapters = len(m.chapters)
-			if len(m.chapters) > 0 {
-				m.currentBook.LatestChapter = m.chapters[len(m.chapters)-1].Title
+			return nil
+		case '1':
+			if a.state == StateMainMenu {
+				a.openBookshelfPage()
+				return nil
+			}
+		case '2':
+			if a.state == StateMainMenu {
+				a.openSearchPage()
+				return nil
 			}
 		}
-
-		return m, nil
-
-	case chapterLoadedMsg:
-		m.currentChapter = msg.chapter
-		m.contentLines = m.wrapContent(msg.chapter.Content)
-		m.loading = false
-		m.state = StateReader
-
-		// 添加调试日志
-		if msg.fromCache {
-			m.addDebugLog("章节加载成功 (缓存): %s", msg.chapter.Title)
-		} else {
-			m.addDebugLog("章节加载成功: %s", msg.chapter.Title)
-		}
-		m.addDebugLog("章节URL: %s", msg.chapter.URL)
-		if len(msg.chapter.Content) == 0 {
-			m.addDebugLog("警告: 章节内容为空")
-		} else {
-			m.addDebugLog("内容长度: %d 字符, %d 行", len(msg.chapter.Content), len(m.contentLines))
-		}
-
-		// 触发章节预加载（只对书架中的书籍预加载）
-		if m.preloader != nil && m.currentBook != nil && m.currentRule != nil {
-			m.preloader.PreloadAhead(
-				m.currentBook.ID,
-				m.currentBook.CurrentSourceID,
-				m.chapterIndex,
-				m.chapters,
-				m.currentRule,
-			)
-			m.addDebugLog("触发预加载: 后续 3 章")
-		}
-
-		// 恢复阅读位置
-		if m.resetLineOffsetOnLoad {
-			m.lineOffset = 0
-			m.resetLineOffsetOnLoad = false
-		} else if m.fromBookshelf && m.currentBook != nil && m.store != nil {
-			progress, _ := m.store.GetReadingProgress(m.currentBook.ID)
-			if progress != nil && progress.ChapterIndex == m.chapterIndex {
-				m.lineOffset = progress.LineOffset
-				if m.lineOffset >= len(m.contentLines) {
-					m.lineOffset = 0
-				}
-			} else {
-				m.lineOffset = 0
-			}
-		} else {
-			m.lineOffset = 0
-		}
-
-		m.statusMsg = ""
-		return m, nil
-
-	case progressSavedMsg:
-		return m, nil
-
-	case bookAddedMsg:
-		if m.bookshelf != nil {
-			m.bookshelf.AddBook(msg.book)
-			if saved := m.bookshelf.FindBook(msg.book.BookName, msg.book.Author); saved != nil {
-				saved.SwitchSource(msg.book.CurrentSourceID)
-			}
-			if m.store != nil {
-				m.store.SaveBookShelf(m.bookshelf)
-			}
-		}
-		sourceName := ""
-		if src := msg.book.GetCurrentSource(); src != nil {
-			sourceName = src.SourceName
-		}
-		if sourceName == "" {
-			m.statusMsg = fmt.Sprintf("已添加到书架: %s", msg.book.BookName)
-		} else {
-			m.statusMsg = fmt.Sprintf("已添加到书架: %s (%s)", msg.book.BookName, sourceName)
-		}
-		return m, nil
-
-	case updateCheckMsg:
-		if m.bookshelf != nil {
-			book := m.bookshelf.FindBookByID(msg.bookID)
-			if book != nil {
-				if msg.hasUpdate {
-					book.MarkUpdate(msg.newChapters, msg.latestChapter)
-					m.statusMsg = fmt.Sprintf("%s 有 %d 章更新", book.BookName, msg.newChapters)
-				} else {
-					m.statusMsg = fmt.Sprintf("%s 暂无更新", book.BookName)
-				}
-				if m.store != nil {
-					m.store.SaveBookShelf(m.bookshelf)
-				}
-			}
-		}
-		m.loading = false
-		return m, nil
-
-	case errorMsg:
-		m.err = msg.err
-		m.loading = false
-		m.statusMsg = fmt.Sprintf("错误: %v", msg.err)
-		// 添加调试日志
-		m.addDebugLog("错误: %v", msg.err)
-		return m, nil
 	}
 
-	return m, nil
-}
-
-// View 渲染
-func (m Model) View() string {
-	if m.loading {
-		return m.renderLoading()
-	}
-
-	switch m.state {
-	case StateMainMenu:
-		return m.renderMainMenu()
+	switch a.state {
 	case StateBookShelf:
-		return m.renderBookShelf()
-	case StateSearch:
-		return m.renderSearch()
+		return a.handleBookshelfKeys(event)
 	case StateSearchResult:
-		return m.renderSearchResult()
+		return a.handleSearchResultKeys(event)
 	case StateToc:
-		return m.renderToc()
+		return a.handleTocKeys(event)
 	case StateReader:
-		return m.renderReader()
-	case StateSourceSwitch:
-		return m.renderSourceSwitch()
+		return a.handleReaderKeys(event)
 	}
 
-	return ""
+	return event
 }
 
-// handleBack 返回上一级
-func (m Model) handleBack() (tea.Model, tea.Cmd) {
-	switch m.state {
-	case StateBookShelf, StateSearch:
-		m.state = StateMainMenu
-		m.fromBookshelf = false
-	case StateSearchResult:
-		m.state = StateSearch
-		m.searchInput.Focus()
-	case StateToc:
-		if m.fromBookshelf {
-			m.state = StateBookShelf
-		} else {
-			m.state = StateSearchResult
-			m.updateSearchStatus()
+func (a *App) handleBookshelfKeys(event *tcell.EventKey) *tcell.EventKey {
+	if event.Key() != tcell.KeyRune {
+		return event
+	}
+
+	switch event.Rune() {
+	case 'd':
+		a.removeSelectedBookshelfBook()
+		return nil
+	case 'u':
+		a.checkSelectedBookUpdate()
+		return nil
+	case 's':
+		a.openSearchPage()
+		return nil
+	}
+	return event
+}
+
+func (a *App) handleSearchResultKeys(event *tcell.EventKey) *tcell.EventKey {
+	if event.Key() == tcell.KeyTAB || event.Key() == tcell.KeyRight {
+		if a.sourcePanelMode == sourcePanelSources && a.searchSourceList.GetItemCount() > 0 {
+			a.app.SetFocus(a.searchSourceList)
+			return nil
 		}
-	case StateReader:
-		// 先改变状态，再保存进度（异步）
-		m.readerFullscreen = false
-		m.state = StateToc
-		cmd := m.saveProgress()
-		return m, cmd
-	case StateSourceSwitch:
-		m.state = StateToc
+		return event
+	}
+	if event.Key() == tcell.KeyLeft || event.Key() == tcell.KeyBacktab {
+		a.app.SetFocus(a.searchResultList)
+		return nil
+	}
+	if event.Key() != tcell.KeyRune {
+		return event
+	}
+
+	switch event.Rune() {
+	case 'h':
+		a.app.SetFocus(a.searchResultList)
+		return nil
+	case 'l':
+		if a.sourcePanelMode == sourcePanelSources && a.searchSourceList.GetItemCount() > 0 {
+			a.app.SetFocus(a.searchSourceList)
+			return nil
+		}
+	case 'a':
+		a.addCurrentSelectionToBookshelf()
+		return nil
+	}
+	return event
+}
+
+func (a *App) handleTocKeys(event *tcell.EventKey) *tcell.EventKey {
+	if event.Key() != tcell.KeyRune {
+		return event
+	}
+
+	switch event.Rune() {
+	case 'a':
+		a.addCurrentSelectionToBookshelf()
+		return nil
+	case 'c':
+		a.openSourceSwitch()
+		return nil
+	}
+	return event
+}
+
+func (a *App) handleReaderKeys(event *tcell.EventKey) *tcell.EventKey {
+	if event.Key() == tcell.KeyRune && event.Rune() == ' ' {
+		a.scheduleReaderChromeRefresh()
+		return event
+	}
+
+	switch event.Key() {
+	case tcell.KeyUp, tcell.KeyDown, tcell.KeyPgUp, tcell.KeyPgDn, tcell.KeyHome, tcell.KeyEnd:
+		a.scheduleReaderChromeRefresh()
+		return event
+	}
+
+	if event.Key() != tcell.KeyRune {
+		return event
+	}
+
+	switch event.Rune() {
+	case 'j', 'k', 'g', 'G':
+		a.scheduleReaderChromeRefresh()
+		return event
+	case 'n':
+		a.loadRelativeChapter(1)
+		return nil
+	case 'p':
+		a.loadRelativeChapter(-1)
+		return nil
+	case 't':
+		a.saveCurrentProgress()
+		a.switchState(StateToc)
+		return nil
+	case 'c':
+		a.saveCurrentProgress()
+		a.openSourceSwitch()
+		return nil
+	case 'a':
+		a.addCurrentSelectionToBookshelf()
+		return nil
+	case '/':
+		a.showDebugLog = !a.showDebugLog
+		a.refreshReaderLayout()
+		a.refreshChrome()
+		return nil
+	}
+	return event
+}
+
+func (a *App) handleBack() {
+	switch a.state {
 	case StateMainMenu:
-		return m, tea.Quit
-	}
-	return m, nil
-}
-
-// === 命令函数 ===
-
-// loadRules 加载规则
-func (m Model) loadRules() tea.Cmd {
-	return func() tea.Msg {
-		rules, err := m.sourceManager.GetSearchableRules(m.config.ActiveRules)
-		if err != nil {
-			return errorMsg{err}
+		a.app.Stop()
+	case StateBookShelf, StateSearch:
+		a.fromBookshelf = false
+		a.switchState(StateMainMenu)
+	case StateSearchResult:
+		a.switchState(StateSearch)
+		a.app.SetFocus(a.searchInput)
+	case StateToc:
+		if a.fromBookshelf {
+			a.switchState(StateBookShelf)
+			return
 		}
-		return rulesLoadedMsg{rules}
-	}
-}
-
-// loadBookshelf 加载书架
-func (m Model) loadBookshelf() tea.Cmd {
-	return func() tea.Msg {
-		if m.store == nil {
-			return bookshelfLoadedMsg{model.NewBookShelf()}
-		}
-		shelf, err := m.store.LoadBookShelf()
-		if err != nil {
-			return bookshelfLoadedMsg{model.NewBookShelf()}
-		}
-		return bookshelfLoadedMsg{shelf}
+		a.switchState(StateSearchResult)
+	case StateReader:
+		a.readerFullscreen = false
+		a.saveCurrentProgress()
+		a.switchState(StateToc)
+	case StateSourceSwitch:
+		a.switchState(StateToc)
 	}
 }
 
-// doMultiSearch 执行多源搜索
-func (m Model) doMultiSearch(searchID int, keyword string) tea.Cmd {
-	if len(m.rules) == 0 {
-		return func() tea.Msg {
-			return errorMsg{fmt.Errorf("未找到可搜索书源")}
-		}
+func (a *App) switchState(state AppState) {
+	a.state = state
+	if !a.showingLoading {
+		a.contentPages.SwitchToPage(a.pageName(state))
+	}
+	a.refreshChrome()
+	a.focusCurrentPage()
+}
+
+func (a *App) pageName(state AppState) string {
+	switch state {
+	case StateMainMenu:
+		return pageMainMenu
+	case StateBookShelf:
+		return pageBookShelf
+	case StateSearch:
+		return pageSearch
+	case StateSearchResult:
+		return pageSearchResult
+	case StateToc:
+		return pageToc
+	case StateReader:
+		return pageReader
+	case StateSourceSwitch:
+		return pageSourceSwitch
+	default:
+		return pageMainMenu
+	}
+}
+
+func (a *App) focusCurrentPage() {
+	if a.showingLoading {
+		a.app.SetFocus(a.loadingView)
+		return
 	}
 
-	cmds := make([]tea.Cmd, 0, len(m.rules))
-	for _, rule := range m.rules {
+	switch a.state {
+	case StateMainMenu:
+		a.app.SetFocus(a.mainMenuList)
+	case StateBookShelf:
+		a.app.SetFocus(a.bookshelfList)
+	case StateSearch:
+		a.app.SetFocus(a.searchInput)
+	case StateSearchResult:
+		if a.app.GetFocus() == a.searchSourceList && a.sourcePanelMode == sourcePanelSources && a.searchSourceList.GetItemCount() > 0 {
+			return
+		}
+		a.app.SetFocus(a.searchResultList)
+	case StateToc:
+		a.app.SetFocus(a.tocList)
+	case StateReader:
+		a.app.SetFocus(a.readerContent)
+	case StateSourceSwitch:
+		a.app.SetFocus(a.sourceSwitchList)
+	}
+}
+
+func (a *App) openBookshelfPage() {
+	a.refreshBookshelfList()
+	a.switchState(StateBookShelf)
+}
+
+func (a *App) openSearchPage() {
+	a.switchState(StateSearch)
+	a.app.SetFocus(a.searchInput)
+}
+
+func (a *App) startSearch() {
+	keyword := strings.TrimSpace(a.searchInput.GetText())
+	if keyword == "" {
+		a.setStatus("请输入书名或作者", statusWarning)
+		a.refreshChrome()
+		return
+	}
+	if len(a.rules) == 0 {
+		a.setStatus("未找到可搜索书源", statusError)
+		a.refreshChrome()
+		return
+	}
+
+	a.keyword = keyword
+	a.searchID++
+	a.searching = true
+	a.searchStartedAt = time.Now()
+	a.resultIndex = 0
+	a.sourceIndex = 0
+	a.currentBook = nil
+	a.selectedBook = nil
+	a.fromBookshelf = false
+	a.searchProgress = make(map[int]*model.SourceSearchStat, len(a.rules))
+	a.searchResultsBySource = make(map[int][]*model.SearchResultWithSource)
+	a.aggregatedResults = model.NewMultiSourceSearchResult(keyword)
+	for _, rule := range a.rules {
+		a.searchProgress[rule.ID] = &model.SourceSearchStat{
+			SourceID:   rule.ID,
+			SourceName: rule.Name,
+			Status:     model.SearchStatusRunning,
+		}
+	}
+	a.aggregatedResults.SourceStats = a.copySearchProgress()
+	a.updateSearchStatus()
+	a.refreshSearchResults()
+	a.switchState(StateSearchResult)
+
+	for _, rule := range a.rules {
 		r := rule
-		cmds = append(cmds, m.searchSource(searchID, keyword, r))
+		go a.searchSource(a.searchID, keyword, r)
 	}
-	return tea.Batch(cmds...)
 }
 
-func (m Model) searchSource(searchID int, keyword string, rule *model.Rule) tea.Cmd {
-	return func() tea.Msg {
-		startedAt := time.Now()
-		searchParser := parser.NewSearchParser(rule, m.httpClient)
-		results, err := searchParser.Parse(keyword)
-		if err != nil {
-			return sourceSearchDoneMsg{
-				searchID:   searchID,
-				keyword:    keyword,
-				sourceID:   rule.ID,
-				sourceName: rule.Name,
-				duration:   time.Since(startedAt),
-				err:        err,
-			}
-		}
+func (a *App) searchSource(searchID int, keyword string, rule *model.Rule) {
+	startedAt := time.Now()
+	searchParser := parser.NewSearchParser(rule, a.httpClient)
+	results, err := searchParser.Parse(keyword)
 
-		sourceResults := make([]*model.SearchResultWithSource, 0, len(results))
+	msg := sourceSearchDone{
+		searchID:   searchID,
+		keyword:    keyword,
+		sourceID:   rule.ID,
+		sourceName: rule.Name,
+		duration:   time.Since(startedAt),
+		err:        err,
+	}
+
+	if err == nil {
+		msg.results = make([]*model.SearchResultWithSource, 0, len(results))
 		for _, result := range results {
 			result.SourceID = rule.ID
-			sourceResults = append(sourceResults, &model.SearchResultWithSource{
+			msg.results = append(msg.results, &model.SearchResultWithSource{
 				SearchResult: result,
 				SourceName:   rule.Name,
 			})
 		}
-
-		return sourceSearchDoneMsg{
-			searchID:   searchID,
-			keyword:    keyword,
-			sourceID:   rule.ID,
-			sourceName: rule.Name,
-			results:    sourceResults,
-			duration:   time.Since(startedAt),
-		}
 	}
+
+	a.app.QueueUpdateDraw(func() {
+		a.handleSourceSearchDone(msg)
+	})
 }
 
-// loadToc 加载目录
-func (m Model) loadToc() tea.Cmd {
-	return func() tea.Msg {
-		var bookURL string
-		var bookID string
-		var sourceID int
-		var rule *model.Rule
-
-		if m.currentBook != nil {
-			src := m.currentBook.GetCurrentSource()
-			if src == nil {
-				return errorMsg{fmt.Errorf("未找到可用书源")}
-			}
-			bookURL = src.BookURL
-			bookID = m.currentBook.ID
-			sourceID = src.SourceID
-			// 获取对应的规则
-			for _, r := range m.rules {
-				if r.ID == src.SourceID {
-					rule = r
-					break
-				}
-			}
-		} else if m.selectedBook != nil {
-			bookURL = m.selectedBook.URL
-			rule = m.currentRule
-			sourceID = m.selectedBook.SourceID
-		} else {
-			return errorMsg{fmt.Errorf("未选择书籍")}
-		}
-
-		if rule == nil {
-			return errorMsg{fmt.Errorf("未找到对应书源规则")}
-		}
-
-		// 尝试从缓存加载目录（只有书架中的书才使用缓存）
-		if bookID != "" && m.store != nil {
-			if cacheStore, ok := m.store.(storage.CacheStore); ok {
-				cachedToc, exists, err := cacheStore.GetTocCache(bookID, sourceID)
-				if err == nil && exists && len(cachedToc) > 0 {
-					// 从缓存构建章节列表
-					chapters := make([]*model.Chapter, len(cachedToc))
-					for i, item := range cachedToc {
-						chapters[i] = &model.Chapter{
-							Title: item.Title,
-							URL:   item.URL,
-							Order: item.Index + 1,
-						}
-					}
-					return tocLoadedMsg{chapters: chapters, fromCache: true}
-				}
-			}
-		}
-
-		// 从网络获取目录
-		tocParser := parser.NewTocParser(rule, m.httpClient)
-		chapters, err := tocParser.Parse(bookURL)
-		if err != nil {
-			return errorMsg{err}
-		}
-
-		// 保存到缓存（只有书架中的书才保存缓存）
-		if bookID != "" && m.store != nil {
-			if cacheStore, ok := m.store.(storage.CacheStore); ok {
-				tocItems := make([]storage.TocCacheItem, len(chapters))
-				for i, ch := range chapters {
-					tocItems[i] = storage.TocCacheItem{
-						Index: i,
-						Title: ch.Title,
-						URL:   ch.URL,
-					}
-				}
-				cacheStore.SaveTocCache(bookID, sourceID, tocItems)
-			}
-		}
-
-		return tocLoadedMsg{chapters: chapters, fromCache: false}
-	}
-}
-
-// loadChapter 加载章节
-func (m Model) loadChapter(index int) tea.Cmd {
-	return func() tea.Msg {
-		if index < 0 || index >= len(m.chapters) {
-			return errorMsg{fmt.Errorf("章节索引无效")}
-		}
-		chapter := m.chapters[index]
-
-		// 获取书籍ID和书源ID用于缓存
-		var bookID string
-		var sourceID int
-		if m.currentBook != nil {
-			bookID = m.currentBook.ID
-			sourceID = m.currentBook.CurrentSourceID
-		}
-
-		// 尝试从缓存加载章节内容（只有书架中的书才使用缓存）
-		if bookID != "" && m.store != nil {
-			if cacheStore, ok := m.store.(storage.CacheStore); ok {
-				content, exists, err := cacheStore.GetChapterContent(bookID, sourceID, index)
-				if err == nil && exists && content != "" {
-					// 使用缓存的内容
-					cachedChapter := &model.Chapter{
-						Title:   chapter.Title,
-						URL:     chapter.URL,
-						Order:   chapter.Order,
-						Content: content,
-					}
-					return chapterLoadedMsg{chapter: cachedChapter, fromCache: true}
-				}
-			}
-		}
-
-		// 从网络获取章节内容
-		chapterParser := parser.NewChapterParser(m.currentRule, m.httpClient)
-		err := chapterParser.Parse(chapter)
-		if err != nil {
-			return errorMsg{err}
-		}
-
-		// 保存到缓存（只有书架中的书且内容非空时才保存）
-		if bookID != "" && chapter.Content != "" && m.store != nil {
-			if cacheStore, ok := m.store.(storage.CacheStore); ok {
-				cacheStore.SaveChapterContent(bookID, sourceID, index, chapter.Content)
-			}
-		}
-
-		return chapterLoadedMsg{chapter: chapter, fromCache: false}
-	}
-}
-
-// saveProgress 保存阅读进度
-func (m Model) saveProgress() tea.Cmd {
-	if m.store == nil || m.currentBook == nil {
-		return nil
-	}
-
-	return func() tea.Msg {
-		progress := model.NewReadingProgress(
-			m.currentBook.ID,
-			m.currentBook.CurrentSourceID,
-			m.chapterIndex,
-			m.currentChapter.Title,
-		)
-		progress.ChapterURL = m.currentChapter.URL
-		progress.UpdatePosition(m.lineOffset, len(m.contentLines))
-
-		m.store.SaveReadingProgress(progress)
-
-		// 更新书籍的最后阅读时间
-		m.currentBook.UpdateLastRead()
-		m.currentBook.ClearUpdateMark()
-		if m.bookshelf != nil {
-			m.store.SaveBookShelf(m.bookshelf)
-		}
-
-		return progressSavedMsg{}
-	}
-}
-
-// addToBookshelf 添加到书架
-func (m Model) addToBookshelf() tea.Cmd {
-	return func() tea.Msg {
-		var book *model.BookRecord
-
-		if m.aggregatedResults != nil && m.resultIndex < len(m.aggregatedResults.Results) {
-			agg := m.aggregatedResults.Results[m.resultIndex]
-			if src := m.selectedAggregatedSource(); src != nil {
-				book = agg.ToBookRecordWithSource(src.SourceID)
-			} else {
-				book = agg.ToBookRecord()
-			}
-		} else if m.selectedBook != nil {
-			sourceName := ""
-			if m.currentRule != nil {
-				sourceName = m.currentRule.Name
-			}
-			book = model.NewBookRecord(m.selectedBook, sourceName)
-		}
-
-		if book == nil {
-			return errorMsg{fmt.Errorf("无法添加到书架")}
-		}
-
-		return bookAddedMsg{book}
-	}
-}
-
-// checkBookUpdate 检查书籍更新
-func (m Model) checkBookUpdate(book *model.BookRecord) tea.Cmd {
-	return func() tea.Msg {
-		src := book.GetCurrentSource()
-		if src == nil {
-			return updateCheckMsg{bookID: book.ID, err: fmt.Errorf("无可用书源")}
-		}
-
-		var rule *model.Rule
-		for _, r := range m.rules {
-			if r.ID == src.SourceID {
-				rule = r
-				break
-			}
-		}
-		if rule == nil {
-			return updateCheckMsg{bookID: book.ID, err: fmt.Errorf("书源规则不存在")}
-		}
-
-		tocParser := parser.NewTocParser(rule, m.httpClient)
-		chapters, err := tocParser.Parse(src.BookURL)
-		if err != nil {
-			return updateCheckMsg{bookID: book.ID, err: err}
-		}
-
-		newCount := len(chapters)
-		oldCount := book.TotalChapters
-		latestChapter := ""
-		if len(chapters) > 0 {
-			latestChapter = chapters[len(chapters)-1].Title
-		}
-
-		return updateCheckMsg{
-			bookID:        book.ID,
-			hasUpdate:     newCount > oldCount,
-			newChapters:   newCount - oldCount,
-			latestChapter: latestChapter,
-		}
-	}
-}
-
-// wrapContent 自动换行处理
-func (m Model) wrapContent(content string) []string {
-	if m.width == 0 {
-		m.width = 80
-	}
-
-	maxWidth := m.width - 6
-	if maxWidth < 20 {
-		maxWidth = 20
-	}
-
-	var lines []string
-	for _, paragraph := range strings.Split(content, "\n") {
-		if paragraph == "" {
-			lines = append(lines, "")
-			continue
-		}
-
-		runes := []rune(paragraph)
-		for len(runes) > 0 {
-			// 按实际显示宽度计算换行位置
-			lineWidth := 0
-			end := 0
-			for i, r := range runes {
-				w := runewidth.RuneWidth(r)
-				if lineWidth+w > maxWidth {
-					break
-				}
-				lineWidth += w
-				end = i + 1
-			}
-			if end == 0 && len(runes) > 0 {
-				// 单个字符超宽，至少取一个
-				end = 1
-			}
-			lines = append(lines, string(runes[:end]))
-			runes = runes[end:]
-		}
-	}
-
-	return lines
-}
-
-// === 状态更新函数 ===
-
-func (m Model) updateMainMenu(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	switch msg.String() {
-	case "up", "k":
-		if m.menuIndex > 0 {
-			m.menuIndex--
-		}
-	case "down", "j":
-		if m.menuIndex < len(mainMenuItems)-1 {
-			m.menuIndex++
-		}
-	case "enter":
-		switch m.menuIndex {
-		case 0: // 书架
-			m.state = StateBookShelf
-			m.bookshelfIndex = 0
-		case 1: // 搜索
-			m.state = StateSearch
-			m.searchInput.Focus()
-			return m, textinput.Blink
-		}
-	case "1":
-		m.state = StateBookShelf
-		m.bookshelfIndex = 0
-	case "2":
-		m.state = StateSearch
-		m.searchInput.Focus()
-		return m, textinput.Blink
-	}
-	return m, nil
-}
-
-func (m Model) updateBookShelf(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	books := m.getBookshelfBooks()
-
-	switch msg.String() {
-	case "up", "k":
-		if m.bookshelfIndex > 0 {
-			m.bookshelfIndex--
-		}
-	case "down", "j":
-		if m.bookshelfIndex < len(books)-1 {
-			m.bookshelfIndex++
-		}
-	case "enter":
-		if len(books) > 0 {
-			m.currentBook = books[m.bookshelfIndex]
-			m.selectedBook = nil
-			m.fromBookshelf = true
-			m.loading = true
-			m.statusMsg = "加载目录..."
-			return m, m.loadToc()
-		}
-	case "d":
-		// 删除书籍
-		if len(books) > 0 && m.bookshelf != nil {
-			book := books[m.bookshelfIndex]
-			m.bookshelf.RemoveBook(book.ID)
-			if m.store != nil {
-				m.store.SaveBookShelf(m.bookshelf)
-				// 同时删除阅读进度
-				progressStore, _ := m.store.LoadProgress()
-				if progressStore != nil {
-					progressStore.RemoveProgress(book.ID)
-					m.store.SaveProgress(progressStore)
-				}
-			}
-			m.statusMsg = fmt.Sprintf("已从书架移除: %s", book.BookName)
-			if m.bookshelfIndex >= len(books)-1 && m.bookshelfIndex > 0 {
-				m.bookshelfIndex--
-			}
-		}
-	case "u":
-		// 检查更新
-		if len(books) > 0 {
-			book := books[m.bookshelfIndex]
-			m.loading = true
-			m.statusMsg = "检查更新..."
-			return m, m.checkBookUpdate(book)
-		}
-	case "s":
-		// 快速搜索
-		m.state = StateSearch
-		m.searchInput.Focus()
-		return m, textinput.Blink
-	}
-	return m, nil
-}
-
-func (m Model) updateSearch(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	switch msg.String() {
-	case "enter":
-		m.keyword = strings.TrimSpace(m.searchInput.Value())
-		if m.keyword != "" {
-			if len(m.rules) == 0 {
-				m.statusMsg = "未找到可搜索书源"
-				return m, nil
-			}
-			m.searchID++
-			m.searching = true
-			m.searchStartedAt = time.Now()
-			m.resultIndex = 0
-			m.sourceIndex = 0
-			m.currentBook = nil
-			m.selectedBook = nil
-			m.searchResults = nil
-			m.searchProgress = make(map[int]*model.SourceSearchStat, len(m.rules))
-			m.searchResultsBySource = make(map[int][]*model.SearchResultWithSource)
-			for _, r := range m.rules {
-				m.searchProgress[r.ID] = &model.SourceSearchStat{
-					SourceID:   r.ID,
-					SourceName: r.Name,
-					Status:     model.SearchStatusRunning,
-				}
-			}
-			m.aggregatedResults = model.NewMultiSourceSearchResult(m.keyword)
-			m.aggregatedResults.SourceStats = m.copySearchProgress()
-			m.state = StateSearchResult
-			m.loading = false
-			m.updateSearchStatus()
-			// 使用多源搜索
-			return m, m.doMultiSearch(m.searchID, m.keyword)
-		}
-	default:
-		var cmd tea.Cmd
-		m.searchInput, cmd = m.searchInput.Update(msg)
-		return m, cmd
-	}
-	return m, nil
-}
-
-func (m Model) updateSearchResult(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	var resultCount int
-	if m.aggregatedResults != nil {
-		resultCount = len(m.aggregatedResults.Results)
-	} else {
-		resultCount = len(m.searchResults)
-	}
-
-	switch msg.String() {
-	case "up", "k":
-		if m.resultIndex > 0 {
-			m.resultIndex--
-			m.sourceIndex = 0
-		}
-	case "down", "j":
-		if m.resultIndex < resultCount-1 {
-			m.resultIndex++
-			m.sourceIndex = 0
-		}
-	case "left", "h":
-		if m.sourceIndex > 0 {
-			m.sourceIndex--
-		}
-	case "right", "l", "tab":
-		if m.sourceIndex < m.selectedAggregatedSourceCount()-1 {
-			m.sourceIndex++
-		}
-	case "enter":
-		if resultCount > 0 {
-			if m.aggregatedResults != nil {
-				agg := m.aggregatedResults.Results[m.resultIndex]
-				selectedSource := m.selectedAggregatedSource()
-				if selectedSource != nil {
-					// 创建书籍记录
-					m.currentBook = agg.ToBookRecordWithSource(selectedSource.SourceID)
-					m.selectedBook = selectedSource.SearchResult
-					// 设置当前规则
-					for _, r := range m.rules {
-						if r.ID == selectedSource.SourceID {
-							m.currentRule = r
-							break
-						}
-					}
-				}
-			} else {
-				m.selectedBook = m.searchResults[m.resultIndex]
-				m.currentBook = nil
-			}
-			m.fromBookshelf = false
-			m.loading = true
-			m.statusMsg = "加载目录..."
-			return m, m.loadToc()
-		}
-	case "a":
-		// 加入书架
-		if resultCount > 0 {
-			return m, m.addToBookshelf()
-		}
-	}
-	return m, nil
-}
-
-func (m Model) updateToc(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	visibleItems := m.height - 10 // 与 renderToc 保持一致
-	if visibleItems < 5 {
-		visibleItems = 5
-	}
-
-	switch msg.String() {
-	case "up", "k":
-		if m.chapterIndex > 0 {
-			m.chapterIndex--
-			if m.chapterIndex < m.tocOffset {
-				m.tocOffset = m.chapterIndex
-			}
-		}
-	case "down", "j":
-		if m.chapterIndex < len(m.chapters)-1 {
-			m.chapterIndex++
-			if m.chapterIndex >= m.tocOffset+visibleItems {
-				m.tocOffset = m.chapterIndex - visibleItems + 1
-			}
-		}
-	case "pgup":
-		// 向上翻页：光标和页面都向上移动一页
-		m.tocOffset -= visibleItems
-		if m.tocOffset < 0 {
-			m.tocOffset = 0
-		}
-		m.chapterIndex = m.tocOffset // 光标在页面第一项
-	case "pgdown":
-		// 向下翻页：光标和页面都向下移动一页
-		m.tocOffset += visibleItems
-		maxOffset := len(m.chapters) - visibleItems
-		if maxOffset < 0 {
-			maxOffset = 0
-		}
-		if m.tocOffset > maxOffset {
-			m.tocOffset = maxOffset
-		}
-		m.chapterIndex = m.tocOffset // 光标在页面第一项
-		// 确保光标不超出范围
-		if m.chapterIndex >= len(m.chapters) {
-			m.chapterIndex = len(m.chapters) - 1
-		}
-	case "home", "g":
-		m.chapterIndex = 0
-		m.tocOffset = 0
-	case "end", "G":
-		m.chapterIndex = len(m.chapters) - 1
-		m.tocOffset = len(m.chapters) - visibleItems
-		if m.tocOffset < 0 {
-			m.tocOffset = 0
-		}
-	case "enter":
-		if len(m.chapters) > 0 {
-			m.loading = true
-			m.statusMsg = "加载章节内容..."
-			return m, m.loadChapter(m.chapterIndex)
-		}
-	case "c":
-		// 切换书源
-		if m.currentBook != nil && len(m.currentBook.Sources) > 1 {
-			m.availableSources = m.currentBook.Sources
-			m.switchIndex = 0
-			// 找到当前源的索引
-			for i, s := range m.availableSources {
-				if s.SourceID == m.currentBook.CurrentSourceID {
-					m.switchIndex = i
-					break
-				}
-			}
-			m.state = StateSourceSwitch
-		} else {
-			m.statusMsg = "只有一个书源，无法切换"
-		}
-	case "a":
-		// 加入书架
-		if m.currentBook != nil && m.bookshelf != nil {
-			existing := m.bookshelf.FindBook(m.currentBook.BookName, m.currentBook.Author)
-			if existing == nil {
-				return m, m.addToBookshelf()
-			} else {
-				m.statusMsg = "该书已在书架中"
-			}
-		} else if m.selectedBook != nil {
-			return m, m.addToBookshelf()
-		}
-	}
-	return m, nil
-}
-
-func (m Model) updateReader(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	pageLines := m.readerContentLineCount()
-	switch msg.String() {
-	case "f11":
-		m.readerFullscreen = !m.readerFullscreen
-		m.clampReaderOffset()
-	case "up", "k":
-		if m.lineOffset > 0 {
-			m.lineOffset--
-		}
-	case "down", "j", " ":
-		if m.lineOffset < len(m.contentLines)-pageLines {
-			m.lineOffset++
-		}
-	case "pgup":
-		m.lineOffset -= pageLines
-		if m.lineOffset < 0 {
-			m.lineOffset = 0
-		}
-	case "pgdown":
-		m.lineOffset += pageLines
-		maxOffset := len(m.contentLines) - pageLines
-		if maxOffset < 0 {
-			maxOffset = 0
-		}
-		if m.lineOffset > maxOffset {
-			m.lineOffset = maxOffset
-		}
-	case "home", "g":
-		m.lineOffset = 0
-	case "end", "G":
-		m.lineOffset = len(m.contentLines) - pageLines
-		if m.lineOffset < 0 {
-			m.lineOffset = 0
-		}
-	case "n", "right", "l":
-		// 下一章
-		if m.chapterIndex < len(m.chapters)-1 {
-			saveCmd := m.saveProgress()
-			m.chapterIndex++
-			m.lineOffset = 0
-			m.resetLineOffsetOnLoad = true
-			m.loading = true
-			m.statusMsg = "加载下一章..."
-			// 同时保存进度和加载下一章
-			return m, tea.Batch(saveCmd, m.loadChapter(m.chapterIndex))
-		}
-	case "p", "left", "h":
-		// 上一章
-		if m.chapterIndex > 0 {
-			saveCmd := m.saveProgress()
-			m.chapterIndex--
-			m.lineOffset = 0
-			m.resetLineOffsetOnLoad = true
-			m.loading = true
-			m.statusMsg = "加载上一章..."
-			// 同时保存进度和加载上一章
-			return m, tea.Batch(saveCmd, m.loadChapter(m.chapterIndex))
-		}
-	case "t":
-		// 返回目录
-		m.readerFullscreen = false
-		m.state = StateToc
-		return m, m.saveProgress()
-	case "c":
-		// 切换书源
-		if m.currentBook != nil && len(m.currentBook.Sources) > 1 {
-			m.readerFullscreen = false
-			m.availableSources = m.currentBook.Sources
-			m.switchIndex = 0
-			for i, s := range m.availableSources {
-				if s.SourceID == m.currentBook.CurrentSourceID {
-					m.switchIndex = i
-					break
-				}
-			}
-			m.state = StateSourceSwitch
-			return m, m.saveProgress()
-		} else {
-			m.statusMsg = "只有一个书源，无法切换"
-		}
-	case "a":
-		// 加入书架
-		if m.currentBook != nil && m.bookshelf != nil {
-			existing := m.bookshelf.FindBook(m.currentBook.BookName, m.currentBook.Author)
-			if existing == nil {
-				return m, m.addToBookshelf()
-			} else {
-				m.statusMsg = "该书已在书架中"
-			}
-		}
-	case "/":
-		// 切换调试日志
-		m.showDebugLog = !m.showDebugLog
-	}
-	return m, nil
-}
-
-func (m Model) updateSourceSwitch(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	switch msg.String() {
-	case "up", "k":
-		if m.switchIndex > 0 {
-			m.switchIndex--
-		}
-	case "down", "j":
-		if m.switchIndex < len(m.availableSources)-1 {
-			m.switchIndex++
-		}
-	case "enter":
-		if len(m.availableSources) > 0 && m.currentBook != nil {
-			newSource := m.availableSources[m.switchIndex]
-			if newSource.SourceID != m.currentBook.CurrentSourceID {
-				// 切换书源
-				m.currentBook.SwitchSource(newSource.SourceID)
-
-				// 更新当前规则
-				for _, r := range m.rules {
-					if r.ID == newSource.SourceID {
-						m.currentRule = r
-						break
-					}
-				}
-
-				// 重新加载目录
-				m.loading = true
-				m.statusMsg = fmt.Sprintf("切换到 %s，重新加载目录...", newSource.SourceName)
-				return m, m.loadToc()
-			} else {
-				m.statusMsg = "已是当前书源"
-				m.state = StateToc
-			}
-		}
-	}
-	return m, nil
-}
-
-// handleMouse 处理鼠标事件
-func (m Model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
-	switch msg.Button {
-	case tea.MouseButtonWheelUp:
-		return m.handleScrollUp()
-	case tea.MouseButtonWheelDown:
-		return m.handleScrollDown()
-	case tea.MouseButtonLeft:
-		if msg.Action == tea.MouseActionRelease {
-			return m.handleClick(msg.X, msg.Y)
-		}
-	}
-	return m, nil
-}
-
-// handleScrollUp 处理向上滚动
-func (m Model) handleScrollUp() (tea.Model, tea.Cmd) {
-	switch m.state {
-	case StateMainMenu:
-		if m.menuIndex > 0 {
-			m.menuIndex--
-		}
-	case StateBookShelf:
-		if m.bookshelfIndex > 0 {
-			m.bookshelfIndex--
-		}
-	case StateSearchResult:
-		resultCount := 0
-		if m.aggregatedResults != nil {
-			resultCount = len(m.aggregatedResults.Results)
-		} else {
-			resultCount = len(m.searchResults)
-		}
-		if m.resultIndex > 0 && resultCount > 0 {
-			m.resultIndex--
-		}
-	case StateToc:
-		if m.chapterIndex > 0 {
-			m.chapterIndex--
-			if m.chapterIndex < m.tocOffset {
-				m.tocOffset = m.chapterIndex
-			}
-		}
-	case StateReader:
-		if m.lineOffset > 0 {
-			m.lineOffset -= 3
-			if m.lineOffset < 0 {
-				m.lineOffset = 0
-			}
-		}
-	case StateSourceSwitch:
-		if m.switchIndex > 0 {
-			m.switchIndex--
-		}
-	}
-	return m, nil
-}
-
-// handleScrollDown 处理向下滚动
-func (m Model) handleScrollDown() (tea.Model, tea.Cmd) {
-	switch m.state {
-	case StateMainMenu:
-		if m.menuIndex < len(mainMenuItems)-1 {
-			m.menuIndex++
-		}
-	case StateBookShelf:
-		books := m.getBookshelfBooks()
-		if m.bookshelfIndex < len(books)-1 {
-			m.bookshelfIndex++
-		}
-	case StateSearchResult:
-		resultCount := 0
-		if m.aggregatedResults != nil {
-			resultCount = len(m.aggregatedResults.Results)
-		} else {
-			resultCount = len(m.searchResults)
-		}
-		if m.resultIndex < resultCount-1 {
-			m.resultIndex++
-		}
-	case StateToc:
-		visibleItems := m.height - 10
-		if visibleItems < 5 {
-			visibleItems = 5
-		}
-		if m.chapterIndex < len(m.chapters)-1 {
-			m.chapterIndex++
-			if m.chapterIndex >= m.tocOffset+visibleItems {
-				m.tocOffset = m.chapterIndex - visibleItems + 1
-			}
-		}
-	case StateReader:
-		maxOffset := len(m.contentLines) - m.readerContentLineCount()
-		if maxOffset < 0 {
-			maxOffset = 0
-		}
-		if m.lineOffset < maxOffset {
-			m.lineOffset += 3
-			if m.lineOffset > maxOffset {
-				m.lineOffset = maxOffset
-			}
-		}
-	case StateSourceSwitch:
-		if m.switchIndex < len(m.availableSources)-1 {
-			m.switchIndex++
-		}
-	}
-	return m, nil
-}
-
-// handleClick 处理鼠标点击
-func (m Model) handleClick(x, y int) (tea.Model, tea.Cmd) {
-	// contentStyle 有 padding(1, 2)，所以内容区域从 y=1 开始
-	// 标题占用约 2-3 行
-	contentStartY := 4 // 标题 + 空行后的内容起始行
-
-	switch m.state {
-	case StateMainMenu:
-		// 主菜单项从第4行开始（标题2行 + 空行1行 + padding 1行）
-		clickedIndex := y - contentStartY
-		if clickedIndex >= 0 && clickedIndex < len(mainMenuItems) {
-			m.menuIndex = clickedIndex
-			// 双击效果：如果点击的是当前选中项，则进入
-			return m.updateMainMenu(tea.KeyMsg{Type: tea.KeyEnter})
-		}
-
-	case StateBookShelf:
-		books := m.getBookshelfBooks()
-		if len(books) == 0 {
-			return m, nil
-		}
-		visibleItems := m.height - 10
-		if visibleItems < 5 {
-			visibleItems = 5
-		}
-		start := 0
-		if m.bookshelfIndex >= visibleItems {
-			start = m.bookshelfIndex - visibleItems + 1
-		}
-		clickedIndex := y - contentStartY + start
-		if clickedIndex >= 0 && clickedIndex < len(books) {
-			if m.bookshelfIndex == clickedIndex {
-				// 点击已选中项，进入
-				return m.updateBookShelf(tea.KeyMsg{Type: tea.KeyEnter})
-			}
-			m.bookshelfIndex = clickedIndex
-		}
-
-	case StateSearchResult:
-		resultCount := 0
-		if m.aggregatedResults != nil {
-			resultCount = len(m.aggregatedResults.Results)
-		} else {
-			resultCount = len(m.searchResults)
-		}
-		if resultCount == 0 {
-			return m, nil
-		}
-
-		visibleItems := m.searchVisibleItems()
-		itemStartY := contentStartY + 1
-		leftWidth, _, stacked := m.searchColumnWidths()
-		if m.aggregatedResults != nil && !stacked && x >= leftWidth+4 {
-			selected := m.selectedAggregatedResult()
-			if selected == nil || len(selected.Sources) == 0 {
-				return m, nil
-			}
-			sourceIndex := clampIndex(m.sourceIndex, len(selected.Sources))
-			start, _ := visibleWindow(sourceIndex, len(selected.Sources), visibleItems)
-			clickedSourceIndex := y - itemStartY + start
-			if clickedSourceIndex >= 0 && clickedSourceIndex < len(selected.Sources) {
-				m.sourceIndex = clickedSourceIndex
-			}
-			return m, nil
-		}
-
-		start, _ := visibleWindow(m.resultIndex, resultCount, visibleItems)
-		clickedIndex := y - itemStartY + start
-		if clickedIndex >= 0 && clickedIndex < resultCount {
-			if m.resultIndex == clickedIndex {
-				// 点击已选中项，进入
-				return m.updateSearchResult(tea.KeyMsg{Type: tea.KeyEnter})
-			}
-			m.resultIndex = clickedIndex
-			m.sourceIndex = 0
-		}
-
-	case StateToc:
-		if len(m.chapters) == 0 {
-			return m, nil
-		}
-		clickedIndex := y - contentStartY + m.tocOffset
-		if clickedIndex >= 0 && clickedIndex < len(m.chapters) {
-			if m.chapterIndex == clickedIndex {
-				// 点击已选中项，进入阅读
-				return m.updateToc(tea.KeyMsg{Type: tea.KeyEnter})
-			}
-			m.chapterIndex = clickedIndex
-		}
-
-	case StateSourceSwitch:
-		if len(m.availableSources) == 0 {
-			return m, nil
-		}
-		clickedIndex := y - contentStartY
-		if clickedIndex >= 0 && clickedIndex < len(m.availableSources) {
-			if m.switchIndex == clickedIndex {
-				// 点击已选中项，确认切换
-				return m.updateSourceSwitch(tea.KeyMsg{Type: tea.KeyEnter})
-			}
-			m.switchIndex = clickedIndex
-		}
-	}
-	return m, nil
-}
-
-// === 渲染函数 ===
-
-func (m Model) renderLoading() string {
-	msg := m.statusMsg
-	if msg == "" {
-		msg = "加载中..."
-	}
-	return lipgloss.Place(
-		m.width, m.height,
-		lipgloss.Center, lipgloss.Center,
-		formatLoading("⏳ "+msg),
-	)
-}
-
-func (m Model) renderMainMenu() string {
-	var b strings.Builder
-
-	b.WriteString(formatTitle("📚 小说阅读器"))
-	b.WriteString("\n\n")
-
-	for i, item := range mainMenuItems {
-		if i == m.menuIndex {
-			b.WriteString(formatSelectedItem(item))
-		} else {
-			b.WriteString(formatItem(" " + item))
-		}
-		b.WriteString("\n")
-	}
-
-	// 显示书架统计
-	if m.bookshelf != nil && len(m.bookshelf.Books) > 0 {
-		b.WriteString("\n")
-		b.WriteString(formatSubtitle(fmt.Sprintf("书架: %d 本书", len(m.bookshelf.Books))))
-	}
-
-	b.WriteString("\n")
-	if m.statusMsg != "" {
-		b.WriteString(formatHighlight(m.statusMsg))
-		b.WriteString("\n")
-	}
-	b.WriteString(formatHelp("↑/↓: 选择  Enter: 确认  1/2: 快捷键  q: 退出"))
-
-	return contentStyle.Render(b.String())
-}
-
-func (m Model) renderBookShelf() string {
-	var b strings.Builder
-
-	b.WriteString(formatTitle("📚 我的书架"))
-	b.WriteString("\n\n")
-
-	books := m.getBookshelfBooks()
-
-	if len(books) == 0 {
-		b.WriteString(formatSubtitle("书架空空如也，去搜索添加一些书吧~"))
-		b.WriteString("\n")
-	} else {
-		visibleItems := m.height - 10
-		if visibleItems < 5 {
-			visibleItems = 5
-		}
-
-		start := 0
-		if m.bookshelfIndex >= visibleItems {
-			start = m.bookshelfIndex - visibleItems + 1
-		}
-		end := start + visibleItems
-		if end > len(books) {
-			end = len(books)
-		}
-
-		for i := start; i < end; i++ {
-			book := books[i]
-			line := fmt.Sprintf("%s - %s", book.BookName, book.Author)
-
-			// 显示更新标记
-			if book.HasUpdate && book.NewChapters > 0 {
-				line += fmt.Sprintf(" [+%d]", book.NewChapters)
-			}
-
-			// 显示书源数量
-			if len(book.Sources) > 1 {
-				line += fmt.Sprintf(" (%d源)", len(book.Sources))
-			}
-
-			if i == m.bookshelfIndex {
-				b.WriteString(formatSelectedItem(line))
-			} else {
-				b.WriteString(formatItem(" " + line))
-			}
-			b.WriteString("\n")
-		}
-	}
-
-	b.WriteString("\n")
-	if m.statusMsg != "" {
-		b.WriteString(formatHighlight(m.statusMsg))
-		b.WriteString("\n")
-	}
-	b.WriteString(formatHelp("↑/↓: 选择  Enter: 继续阅读  d: 删除  u: 检查更新  s: 搜索  Esc: 返回"))
-
-	return contentStyle.Render(b.String())
-}
-
-func (m Model) renderSearch() string {
-	var b strings.Builder
-
-	b.WriteString(formatTitle("🔍 搜索小说"))
-	b.WriteString("\n")
-	b.WriteString(formatSubtitle(fmt.Sprintf("将搜索 %d 个书源", len(m.rules))))
-	b.WriteString("\n\n")
-
-	b.WriteString(m.searchInput.View())
-	b.WriteString("\n\n")
-
-	if m.statusMsg != "" {
-		b.WriteString(formatError(m.statusMsg))
-		b.WriteString("\n")
-	}
-
-	b.WriteString(formatHelp("Enter: 搜索  Esc: 返回"))
-
-	return contentStyle.Render(b.String())
-}
-
-func (m Model) renderSearchResult() string {
-	var b strings.Builder
-
-	b.WriteString(formatTitle(fmt.Sprintf("📖 搜索结果: %s", m.keyword)))
-	b.WriteString("\n")
-	b.WriteString(formatSubtitle(m.statusMsg))
-	b.WriteString("\n\n")
-
-	if m.aggregatedResults != nil {
-		b.WriteString(m.renderAggregatedSearchResults())
-	} else if len(m.searchResults) == 0 {
-		b.WriteString(formatError("未找到相关书籍"))
-	} else {
-		b.WriteString(m.renderLegacySearchResults())
-	}
-
-	b.WriteString("\n")
-	b.WriteString(formatHelp("↑/↓: 选择小说  ←/→: 选择书源  Enter: 查看目录  a: 用当前源加入书架  Esc: 返回"))
-
-	return contentStyle.Render(b.String())
-}
-
-func (m Model) renderAggregatedSearchResults() string {
-	leftWidth, rightWidth, stacked := m.searchColumnWidths()
-	visibleItems := m.searchVisibleItems()
-	results := m.aggregatedResults.Results
-
-	var left strings.Builder
-	left.WriteString(formatSubtitle("小说"))
-	left.WriteString("\n")
-	if len(results) == 0 {
-		if m.searching {
-			left.WriteString(formatLoading("搜索中，等待书源返回结果..."))
-		} else {
-			left.WriteString(formatError("未找到相关书籍"))
-		}
-		left.WriteString("\n")
-	} else {
-		start, end := visibleWindow(m.resultIndex, len(results), visibleItems)
-		for i := start; i < end; i++ {
-			result := results[i]
-			line := fmt.Sprintf("%s - %s", result.BookName, result.Author)
-			if result.SourceCount > 1 {
-				line += fmt.Sprintf(" [%d源]", result.SourceCount)
-			}
-			if result.LatestChapter != "" {
-				line += fmt.Sprintf(" | %s", result.LatestChapter)
-			}
-			line = truncateDisplay(line, leftWidth-4)
-			if i == m.resultIndex {
-				left.WriteString(formatSelectedItem(line))
-			} else {
-				left.WriteString(formatItem(" " + line))
-			}
-			left.WriteString("\n")
-		}
-	}
-
-	var right strings.Builder
-	selected := m.selectedAggregatedResult()
-	if selected == nil {
-		right.WriteString(formatSubtitle("书源进度"))
-		right.WriteString("\n")
-		right.WriteString(m.renderSearchProgressList(visibleItems, rightWidth))
-	} else {
-		right.WriteString(formatSubtitle(truncateDisplay(fmt.Sprintf("书源: %s", selected.BookName), rightWidth-2)))
-		right.WriteString("\n")
-		if len(selected.Sources) == 0 {
-			right.WriteString(formatError("当前小说暂无可用书源"))
-			right.WriteString("\n")
-		} else {
-			sourceIndex := clampIndex(m.sourceIndex, len(selected.Sources))
-			start, end := visibleWindow(sourceIndex, len(selected.Sources), visibleItems)
-			for i := start; i < end; i++ {
-				src := selected.Sources[i]
-				line := src.SourceName
-				if src.LatestChapter != "" {
-					line += fmt.Sprintf(" | %s", src.LatestChapter)
-				}
-				if src.LastUpdateTime != "" {
-					line += fmt.Sprintf(" (%s)", src.LastUpdateTime)
-				}
-				line = truncateDisplay(line, rightWidth-4)
-				if i == sourceIndex {
-					right.WriteString(formatSelectedItem(line))
-				} else {
-					right.WriteString(formatItem(" " + line))
-				}
-				right.WriteString("\n")
-			}
-			if m.searching {
-				right.WriteString("\n")
-				right.WriteString(formatLoading("搜索中，后续书源会继续合并"))
-				right.WriteString("\n")
-			}
-		}
-	}
-
-	if stacked {
-		return left.String() + "\n" + right.String()
-	}
-
-	leftPane := lipgloss.NewStyle().Width(leftWidth).Render(left.String())
-	rightPane := lipgloss.NewStyle().Width(rightWidth).PaddingLeft(2).Render(right.String())
-	return lipgloss.JoinHorizontal(lipgloss.Top, leftPane, rightPane)
-}
-
-func (m Model) renderLegacySearchResults() string {
-	var b strings.Builder
-
-	visibleItems := m.searchVisibleItems()
-	start, end := visibleWindow(m.resultIndex, len(m.searchResults), visibleItems)
-	for i := start; i < end; i++ {
-		result := m.searchResults[i]
-		line := fmt.Sprintf("%s - %s", result.BookName, result.Author)
-		if result.LatestChapter != "" {
-			line += fmt.Sprintf(" | %s", result.LatestChapter)
-		}
-		line = truncateDisplay(line, m.width-8)
-		if i == m.resultIndex {
-			b.WriteString(formatSelectedItem(line))
-		} else {
-			b.WriteString(formatItem(" " + line))
-		}
-		b.WriteString("\n")
-	}
-
-	return b.String()
-}
-
-func (m Model) renderSearchProgressList(limit int, width int) string {
-	var b strings.Builder
-	count := 0
-	for _, rule := range m.rules {
-		if count >= limit {
-			break
-		}
-		stat := m.searchProgress[rule.ID]
-		status := model.SearchStatusRunning
-		resultCount := 0
-		if stat != nil {
-			status = stat.Status
-			resultCount = stat.ResultCount
-		}
-		line := fmt.Sprintf("%s: %s", rule.Name, status.String())
-		if resultCount > 0 {
-			line += fmt.Sprintf("，%d 条", resultCount)
-		}
-		line = truncateDisplay(line, width-4)
-		b.WriteString(formatItem(" " + line))
-		b.WriteString("\n")
-		count++
-	}
-	return b.String()
-}
-
-func (m Model) renderToc() string {
-	var b strings.Builder
-
-	bookName := ""
-	sourceName := ""
-	if m.currentBook != nil {
-		bookName = m.currentBook.BookName
-		src := m.currentBook.GetCurrentSource()
-		if src != nil {
-			sourceName = src.SourceName
-		}
-	} else if m.selectedBook != nil {
-		bookName = m.selectedBook.BookName
-		if m.currentRule != nil {
-			sourceName = m.currentRule.Name
-		}
-	}
-
-	b.WriteString(formatTitle(fmt.Sprintf("📑 %s", bookName)))
-	b.WriteString("\n")
-	if sourceName != "" {
-		b.WriteString(formatSubtitle(fmt.Sprintf("当前书源: %s | %s", sourceName, m.statusMsg)))
-	} else {
-		b.WriteString(formatSubtitle(m.statusMsg))
-	}
-	b.WriteString("\n\n")
-
-	if len(m.chapters) == 0 {
-		b.WriteString(formatError("目录为空"))
-	} else {
-		visibleItems := m.height - 10
-		if visibleItems < 5 {
-			visibleItems = 5
-		}
-
-		end := m.tocOffset + visibleItems
-		if end > len(m.chapters) {
-			end = len(m.chapters)
-		}
-
-		for i := m.tocOffset; i < end; i++ {
-			chapter := m.chapters[i]
-			line := fmt.Sprintf("%d. %s", chapter.Order, chapter.Title)
-			if i == m.chapterIndex {
-				b.WriteString(formatSelectedItem(line))
-			} else {
-				b.WriteString(formatItem(" " + line))
-			}
-			b.WriteString("\n")
-		}
-
-		if m.tocOffset > 0 {
-			b.WriteString(formatSubtitle("  ↑ 更多..."))
-			b.WriteString("\n")
-		}
-		if end < len(m.chapters) {
-			b.WriteString(formatSubtitle("  ↓ 更多..."))
-			b.WriteString("\n")
-		}
-	}
-
-	b.WriteString("\n")
-	helpText := "↑/↓: 选择  PgUp/PgDn: 翻页  Enter: 阅读  a: 加入书架"
-	if m.currentBook != nil && len(m.currentBook.Sources) > 1 {
-		helpText += "  c: 换源"
-	}
-	helpText += "  Esc: 返回"
-	b.WriteString(formatHelp(helpText))
-
-	return contentStyle.Render(b.String())
-}
-
-func (m Model) renderReader() string {
-	var b strings.Builder
-
-	if !m.readerFullscreen && m.currentChapter != nil {
-		b.WriteString(formatChapterTitle(m.currentChapter.Title))
-		b.WriteString("\n\n")
-	}
-
-	contentLinesAvailable := m.readerContentLineCount()
-
-	// 章节内容
-	if len(m.contentLines) == 0 {
-		b.WriteString(formatError("章节内容为空"))
-	} else {
-		end := m.lineOffset + contentLinesAvailable
-		if end > len(m.contentLines) {
-			end = len(m.contentLines)
-		}
-
-		for i := m.lineOffset; i < end; i++ {
-			b.WriteString(m.contentLines[i])
-			b.WriteString("\n")
-		}
-	}
-
-	if m.readerFullscreen {
-		return contentStyle.Render(b.String())
-	}
-
-	// 调试日志区域
-	if m.showDebugLog {
-		b.WriteString("\n")
-		b.WriteString(formatSubtitle("─── 调试日志 (按 / 关闭) ───"))
-		b.WriteString("\n")
-
-		// 显示当前章节URL
-		if m.currentChapter != nil && m.currentChapter.URL != "" {
-			b.WriteString(formatItem(fmt.Sprintf("章节URL: %s", m.currentChapter.URL)))
-			b.WriteString("\n")
-		}
-
-		// 显示书源信息
-		if m.currentRule != nil {
-			b.WriteString(formatItem(fmt.Sprintf("书源: %s (%s)", m.currentRule.Name, m.currentRule.URL)))
-			b.WriteString("\n")
-		}
-
-		// 显示章节调试信息
-		if m.currentChapter != nil && m.currentChapter.Debug != nil {
-			debug := m.currentChapter.Debug
-			b.WriteString(formatItem(fmt.Sprintf("HTTP状态码: %d | 响应长度: %d 字节", debug.ResponseCode, debug.ContentLength)))
-			b.WriteString("\n")
-			b.WriteString(formatItem(fmt.Sprintf("选择器: %s", debug.SelectorUsed)))
-			b.WriteString("\n")
-
-			if debug.ErrorMsg != "" {
-				b.WriteString(formatError(fmt.Sprintf("错误: %s", debug.ErrorMsg)))
-				b.WriteString("\n")
-			}
-
-			// 显示选择器匹配到的HTML片段
-			if debug.SelectedHTML != "" {
-				b.WriteString(formatSubtitle("选择器匹配内容:"))
-				b.WriteString("\n")
-				// 截取显示
-				preview := debug.SelectedHTML
-				if len(preview) > 500 {
-					preview = preview[:500] + "..."
-				}
-				b.WriteString(formatItem(preview))
-				b.WriteString("\n")
-
-				// 显示过滤后的内容
-				if debug.FilteredText != "" {
-					b.WriteString(formatSubtitle("过滤后内容:"))
-					b.WriteString("\n")
-					preview = debug.FilteredText
-					if len(preview) > 300 {
-						preview = preview[:300] + "..."
-					}
-					b.WriteString(formatItem(preview))
-					b.WriteString("\n")
-				} else {
-					b.WriteString(formatError("过滤后内容为空! 检查规则的 filterTxt/filterTag/paragraphTag 设置"))
-					b.WriteString("\n")
-				}
-			} else {
-				b.WriteString(formatError("选择器未匹配到任何内容!"))
-				b.WriteString("\n")
-				// 显示原始HTML片段帮助调试
-				if debug.RawHTML != "" {
-					b.WriteString(formatSubtitle("原始HTML片段:"))
-					b.WriteString("\n")
-					preview := debug.RawHTML
-					if len(preview) > 800 {
-						preview = preview[:800] + "..."
-					}
-					b.WriteString(formatItem(preview))
-					b.WriteString("\n")
-				}
-			}
-		}
-
-		// 显示最近的调试日志
-		if len(m.debugLogs) > 0 {
-			b.WriteString(formatSubtitle("操作日志:"))
-			b.WriteString("\n")
-			logLines := 5
-			startLog := len(m.debugLogs) - logLines
-			if startLog < 0 {
-				startLog = 0
-			}
-			for i := startLog; i < len(m.debugLogs); i++ {
-				b.WriteString(formatItem(m.debugLogs[i]))
-				b.WriteString("\n")
-			}
-		}
-	}
-
-	// 进度信息
-	progress := 0.0
-	if len(m.contentLines) > 0 {
-		progress = float64(m.lineOffset+contentLinesAvailable) / float64(len(m.contentLines)) * 100
-	}
-	if progress > 100 {
-		progress = 100
-	}
-	chapterProgress := fmt.Sprintf("章节 %d/%d", m.chapterIndex+1, len(m.chapters))
-	pageProgress := fmt.Sprintf("%.0f%%", progress)
-
-	b.WriteString("\n")
-
-	helpText := "j/k: 滚动  n/p: 上下章  t: 目录  F11: 沉浸"
-	if m.currentBook != nil && len(m.currentBook.Sources) > 1 {
-		helpText += "  c: 换源"
-	}
-	helpText += fmt.Sprintf("  /: 调试  |  %s  %s", chapterProgress, pageProgress)
-
-	b.WriteString(formatHelp(helpText))
-
-	return contentStyle.Render(b.String())
-}
-
-func (m Model) renderSourceSwitch() string {
-	var b strings.Builder
-
-	bookName := ""
-	if m.currentBook != nil {
-		bookName = m.currentBook.BookName
-	}
-
-	b.WriteString(formatTitle(fmt.Sprintf("🔄 切换书源: %s", bookName)))
-	b.WriteString("\n")
-	b.WriteString(formatSubtitle("选择一个书源继续阅读"))
-	b.WriteString("\n\n")
-
-	for i, src := range m.availableSources {
-		line := src.SourceName
-		if src.SourceID == m.currentBook.CurrentSourceID {
-			line += " (当前)"
-		}
-		if src.TotalChapters > 0 {
-			line += fmt.Sprintf(" - %d章", src.TotalChapters)
-		}
-		if src.LatestChapter != "" {
-			line += fmt.Sprintf(" - %s", src.LatestChapter)
-		}
-
-		if i == m.switchIndex {
-			b.WriteString(formatSelectedItem(line))
-		} else {
-			b.WriteString(formatItem(" " + line))
-		}
-		b.WriteString("\n")
-	}
-
-	b.WriteString("\n")
-	if m.statusMsg != "" {
-		b.WriteString(formatHighlight(m.statusMsg))
-		b.WriteString("\n")
-	}
-	b.WriteString(formatHelp("↑/↓: 选择  Enter: 确认切换  Esc: 取消"))
-
-	return contentStyle.Render(b.String())
-}
-
-// === 辅助函数 ===
-
-func (m Model) getBookshelfBooks() []*model.BookRecord {
-	if m.bookshelf == nil {
-		return nil
-	}
-	return m.bookshelf.GetBooksSortedByLastRead()
-}
-
-func (m Model) readerContentLineCount() int {
-	if m.readerFullscreen {
-		lines := m.height - 2
-		if lines < 5 {
-			lines = m.linesPerPage
-		}
-		if lines < 5 {
-			lines = 5
-		}
-		return lines
-	}
-
-	lines := m.linesPerPage
-	if m.showDebugLog {
-		lines = m.linesPerPage / 2
-		if lines < 5 {
-			lines = 5
-		}
-	}
-	return lines
-}
-
-func (m Model) readerMaxLineOffset() int {
-	maxOffset := len(m.contentLines) - m.readerContentLineCount()
-	if maxOffset < 0 {
-		return 0
-	}
-	return maxOffset
-}
-
-func (m *Model) clampReaderOffset() {
-	maxOffset := m.readerMaxLineOffset()
-	if m.lineOffset > maxOffset {
-		m.lineOffset = maxOffset
-	}
-	if m.lineOffset < 0 {
-		m.lineOffset = 0
-	}
-}
-
-func (m Model) selectedAggregatedResult() *model.AggregatedSearchResult {
-	if m.aggregatedResults == nil || len(m.aggregatedResults.Results) == 0 {
-		return nil
-	}
-	return m.aggregatedResults.Results[clampIndex(m.resultIndex, len(m.aggregatedResults.Results))]
-}
-
-func (m Model) selectedAggregatedSource() *model.SearchResultWithSource {
-	selected := m.selectedAggregatedResult()
-	if selected == nil || len(selected.Sources) == 0 {
-		return nil
-	}
-	return selected.Sources[clampIndex(m.sourceIndex, len(selected.Sources))]
-}
-
-func (m Model) selectedAggregatedSourceCount() int {
-	selected := m.selectedAggregatedResult()
-	if selected == nil {
-		return 0
-	}
-	return len(selected.Sources)
-}
-
-func (m Model) selectedAggregatedKey() string {
-	selected := m.selectedAggregatedResult()
-	if selected == nil {
-		return ""
-	}
-	return selected.NormalizedKey
-}
-
-func (m Model) selectedAggregatedSourceID() int {
-	selected := m.selectedAggregatedSource()
-	if selected == nil {
-		return 0
-	}
-	return selected.SourceID
-}
-
-func (m *Model) restoreSearchSelection(selectedKey string, selectedSourceID int) {
-	if m.aggregatedResults == nil || len(m.aggregatedResults.Results) == 0 {
-		m.resultIndex = 0
-		m.sourceIndex = 0
+func (a *App) handleSourceSearchDone(msg sourceSearchDone) {
+	if msg.searchID != a.searchID || msg.keyword != a.keyword {
 		return
 	}
 
-	if selectedKey != "" {
-		for i, result := range m.aggregatedResults.Results {
-			if result.NormalizedKey == selectedKey {
-				m.resultIndex = i
-				break
+	selectedKey := a.selectedAggregatedKey()
+	selectedSourceID := a.selectedAggregatedSourceID()
+
+	status := model.SearchStatusSuccess
+	if msg.err != nil {
+		status = model.SearchStatusFailed
+		delete(a.searchResultsBySource, msg.sourceID)
+		a.addDebugLog("搜索失败: %s - %v", msg.sourceName, msg.err)
+	} else {
+		a.searchResultsBySource[msg.sourceID] = msg.results
+		a.addDebugLog("搜索完成: %s - %d 条结果", msg.sourceName, len(msg.results))
+	}
+
+	a.searchProgress[msg.sourceID] = &model.SourceSearchStat{
+		SourceID:    msg.sourceID,
+		SourceName:  msg.sourceName,
+		Status:      status,
+		ResultCount: len(msg.results),
+		Duration:    msg.duration.Milliseconds(),
+	}
+	if msg.err != nil {
+		a.searchProgress[msg.sourceID].Error = msg.err.Error()
+	}
+
+	a.aggregatedResults = model.AggregateSearchResults(a.keyword, a.searchResultsBySource)
+	a.aggregatedResults.SourceStats = a.copySearchProgress()
+	a.aggregatedResults.StartTime = a.searchStartedAt
+	a.aggregatedResults.EndTime = time.Now()
+	a.searching = !a.isSearchComplete()
+	a.restoreSearchSelection(selectedKey, selectedSourceID)
+	a.updateSearchStatus()
+	a.refreshSearchResults()
+	a.refreshChrome()
+}
+
+func (a *App) openSelectedSearchResult() {
+	selected := a.selectedAggregatedResult()
+	if selected == nil {
+		return
+	}
+
+	selectedSource := a.selectedAggregatedSource()
+	if selectedSource == nil {
+		return
+	}
+
+	book := selected.ToBookRecordWithSource(selectedSource.SourceID)
+	if book == nil {
+		a.setStatus("无法创建书籍记录", statusError)
+		a.refreshChrome()
+		return
+	}
+
+	if a.bookshelf != nil {
+		if existing := a.bookshelf.FindBook(book.BookName, book.Author); existing != nil {
+			for _, src := range book.Sources {
+				existing.AddSource(src)
+			}
+			existing.SwitchSource(book.CurrentSourceID)
+			book = existing
+		}
+	}
+
+	a.currentBook = book
+	a.selectedBook = selectedSource.SearchResult
+	a.currentRule = a.findRuleBySourceID(selectedSource.SourceID)
+	a.fromBookshelf = false
+	a.beginLoadToc()
+}
+
+func (a *App) openSelectedBookshelfBook() {
+	books := a.getBookshelfBooks()
+	if len(books) == 0 {
+		return
+	}
+
+	index := clampIndex(a.bookshelfIndex, len(books))
+	a.currentBook = books[index]
+	a.selectedBook = nil
+	a.fromBookshelf = true
+	a.beginLoadToc()
+}
+
+func (a *App) beginLoadToc() {
+	bookURL, bookID, sourceID, rule, err := a.resolveTocContext()
+	if err != nil {
+		a.setStatus(err.Error(), statusError)
+		a.refreshChrome()
+		return
+	}
+
+	a.showLoading("加载目录...", "正在读取章节列表")
+	go func(bookURL, bookID string, sourceID int, rule *model.Rule) {
+		result := a.loadToc(bookURL, bookID, sourceID, rule)
+		a.app.QueueUpdateDraw(func() {
+			a.handleTocLoaded(result)
+		})
+	}(bookURL, bookID, sourceID, rule)
+}
+
+func (a *App) resolveTocContext() (bookURL string, bookID string, sourceID int, rule *model.Rule, err error) {
+	if a.currentBook != nil {
+		src := a.currentBook.GetCurrentSource()
+		if src == nil {
+			return "", "", 0, nil, fmt.Errorf("未找到可用书源")
+		}
+		bookURL = src.BookURL
+		bookID = a.persistedBookID(a.currentBook)
+		sourceID = src.SourceID
+		rule = a.findRuleBySourceID(src.SourceID)
+	} else if a.selectedBook != nil {
+		bookURL = a.selectedBook.URL
+		sourceID = a.selectedBook.SourceID
+		rule = a.findRuleBySourceID(a.selectedBook.SourceID)
+	} else {
+		return "", "", 0, nil, fmt.Errorf("未选择书籍")
+	}
+
+	if rule == nil {
+		return "", "", 0, nil, fmt.Errorf("未找到对应书源规则")
+	}
+	return bookURL, bookID, sourceID, rule, nil
+}
+
+func (a *App) loadToc(bookURL, bookID string, sourceID int, rule *model.Rule) tocLoadResult {
+	if bookID != "" && a.store != nil {
+		if cacheStore, ok := a.store.(storage.CacheStore); ok {
+			cachedToc, exists, err := cacheStore.GetTocCache(bookID, sourceID)
+			if err == nil && exists && len(cachedToc) > 0 {
+				chapters := make([]*model.Chapter, len(cachedToc))
+				for i, item := range cachedToc {
+					chapters[i] = &model.Chapter{
+						Title: item.Title,
+						URL:   item.URL,
+						Order: item.Index + 1,
+					}
+				}
+				return tocLoadResult{chapters: chapters, fromCache: true}
 			}
 		}
 	}
-	m.resultIndex = clampIndex(m.resultIndex, len(m.aggregatedResults.Results))
 
-	selected := m.aggregatedResults.Results[m.resultIndex]
-	if selectedSourceID != 0 {
-		for i, src := range selected.Sources {
-			if src.SourceID == selectedSourceID {
-				m.sourceIndex = i
-				return
+	tocParser := parser.NewTocParser(rule, a.httpClient)
+	chapters, err := tocParser.Parse(bookURL)
+	if err != nil {
+		return tocLoadResult{err: err}
+	}
+
+	if bookID != "" && a.store != nil {
+		if cacheStore, ok := a.store.(storage.CacheStore); ok {
+			tocItems := make([]storage.TocCacheItem, len(chapters))
+			for i, chapter := range chapters {
+				tocItems[i] = storage.TocCacheItem{
+					Index: i,
+					Title: chapter.Title,
+					URL:   chapter.URL,
+				}
+			}
+			_ = cacheStore.SaveTocCache(bookID, sourceID, tocItems)
+		}
+	}
+
+	return tocLoadResult{chapters: chapters}
+}
+
+func (a *App) handleTocLoaded(result tocLoadResult) {
+	a.hideLoading()
+	if result.err != nil {
+		a.setStatus(fmt.Sprintf("加载目录失败: %v", result.err), statusError)
+		a.addDebugLog("加载目录失败: %v", result.err)
+		a.contentPages.SwitchToPage(a.pageName(a.state))
+		a.refreshChrome()
+		a.focusCurrentPage()
+		return
+	}
+
+	a.chapters = result.chapters
+	a.currentRule = a.matchCurrentRule()
+	a.chapterIndex = 0
+
+	var bookURL string
+	if a.currentBook != nil {
+		if src := a.currentBook.GetCurrentSource(); src != nil {
+			bookURL = src.BookURL
+		}
+	} else if a.selectedBook != nil {
+		bookURL = a.selectedBook.URL
+	}
+
+	if result.fromCache {
+		a.addDebugLog("目录加载成功 (缓存): %d 章", len(result.chapters))
+	} else {
+		a.addDebugLog("目录加载成功: %d 章", len(result.chapters))
+	}
+	a.addDebugLog("书籍URL: %s", bookURL)
+	if a.currentRule != nil {
+		a.addDebugLog("当前规则: %s (%s)", a.currentRule.Name, a.currentRule.URL)
+	}
+
+	if a.fromBookshelf && a.currentBook != nil && a.store != nil {
+		if progress, err := a.store.GetReadingProgress(a.persistedBookID(a.currentBook)); err == nil && progress != nil {
+			a.chapterIndex = clampIndex(progress.ChapterIndex, len(a.chapters))
+		}
+	}
+
+	if a.currentBook != nil {
+		a.currentBook.TotalChapters = len(a.chapters)
+		if len(a.chapters) > 0 {
+			a.currentBook.LatestChapter = a.chapters[len(a.chapters)-1].Title
+		}
+	}
+
+	a.setStatus(fmt.Sprintf("共 %d 章", len(a.chapters)), statusInfo)
+	a.refreshTocList()
+	a.switchState(StateToc)
+}
+
+func (a *App) openSelectedChapter() {
+	if len(a.chapters) == 0 {
+		return
+	}
+
+	index := clampIndex(a.chapterIndex, len(a.chapters))
+	a.beginLoadChapter(index)
+}
+
+func (a *App) beginLoadChapter(index int) {
+	if index < 0 || index >= len(a.chapters) {
+		a.setStatus("章节索引无效", statusError)
+		a.refreshChrome()
+		return
+	}
+
+	chapter := a.chapters[index]
+	rule := a.currentRule
+	if rule == nil {
+		a.setStatus("未找到书源规则", statusError)
+		a.refreshChrome()
+		return
+	}
+
+	a.chapterIndex = index
+	bookID := ""
+	sourceID := 0
+	if a.currentBook != nil {
+		bookID = a.persistedBookID(a.currentBook)
+		sourceID = a.currentBook.CurrentSourceID
+	}
+
+	a.showLoading("加载章节内容...", sanitizeSingleLine(chapter.Title))
+	go func(index int, chapter *model.Chapter, bookID string, sourceID int, rule *model.Rule) {
+		result := a.loadChapter(index, chapter, bookID, sourceID, rule)
+		a.app.QueueUpdateDraw(func() {
+			a.handleChapterLoaded(result)
+		})
+	}(index, chapter, bookID, sourceID, rule)
+}
+
+func (a *App) loadChapter(index int, chapter *model.Chapter, bookID string, sourceID int, rule *model.Rule) chapterLoadResult {
+	if bookID != "" && a.store != nil {
+		if cacheStore, ok := a.store.(storage.CacheStore); ok {
+			content, exists, err := cacheStore.GetChapterContent(bookID, sourceID, index)
+			if err == nil && exists && content != "" {
+				cachedChapter := &model.Chapter{
+					Title:   chapter.Title,
+					URL:     chapter.URL,
+					Order:   chapter.Order,
+					Content: content,
+				}
+				return chapterLoadResult{chapter: cachedChapter, fromCache: true}
 			}
 		}
 	}
-	m.sourceIndex = clampIndex(m.sourceIndex, len(selected.Sources))
-}
 
-func (m Model) copySearchProgress() map[int]*model.SourceSearchStat {
-	copied := make(map[int]*model.SourceSearchStat, len(m.searchProgress))
-	for sourceID, stat := range m.searchProgress {
-		if stat == nil {
-			continue
-		}
-		value := *stat
-		copied[sourceID] = &value
+	loaded := &model.Chapter{
+		Title: chapter.Title,
+		URL:   chapter.URL,
+		Order: chapter.Order,
 	}
-	return copied
-}
 
-func (m Model) isSearchComplete() bool {
-	total := m.searchSourceTotal()
-	return total > 0 && m.completedSearchSourceCount() >= total
-}
-
-func (m Model) searchSourceTotal() int {
-	if len(m.searchProgress) > 0 {
-		return len(m.searchProgress)
+	chapterParser := parser.NewChapterParser(rule, a.httpClient)
+	if err := chapterParser.Parse(loaded); err != nil {
+		return chapterLoadResult{err: err}
 	}
-	return len(m.rules)
-}
 
-func (m Model) completedSearchSourceCount() int {
-	count := 0
-	for _, stat := range m.searchProgress {
-		if stat != nil && isFinalSearchStatus(stat.Status) {
-			count++
+	if bookID != "" && loaded.Content != "" && a.store != nil {
+		if cacheStore, ok := a.store.(storage.CacheStore); ok {
+			_ = cacheStore.SaveChapterContent(bookID, sourceID, index, loaded.Content)
 		}
 	}
-	return count
+
+	return chapterLoadResult{chapter: loaded}
 }
 
-func (m Model) resultSourceCount() int {
-	count := 0
-	for _, results := range m.searchResultsBySource {
-		if len(results) > 0 {
-			count++
+func (a *App) handleChapterLoaded(result chapterLoadResult) {
+	a.hideLoading()
+	if result.err != nil {
+		a.setStatus(fmt.Sprintf("加载章节失败: %v", result.err), statusError)
+		a.addDebugLog("加载章节失败: %v", result.err)
+		a.contentPages.SwitchToPage(a.pageName(StateToc))
+		a.refreshChrome()
+		a.app.SetFocus(a.tocList)
+		return
+	}
+
+	a.currentChapter = result.chapter
+	if result.fromCache {
+		a.addDebugLog("章节加载成功 (缓存): %s", result.chapter.Title)
+	} else {
+		a.addDebugLog("章节加载成功: %s", result.chapter.Title)
+	}
+	a.addDebugLog("章节URL: %s", result.chapter.URL)
+	if len(result.chapter.Content) == 0 {
+		a.addDebugLog("警告: 章节内容为空")
+	} else {
+		a.addDebugLog("内容长度: %d 字符", len(result.chapter.Content))
+	}
+
+	if a.preloader != nil && a.currentBook != nil && a.currentRule != nil {
+		bookID := a.persistedBookID(a.currentBook)
+		if bookID != "" {
+			a.preloader.PreloadAhead(
+				bookID,
+				a.currentBook.CurrentSourceID,
+				a.chapterIndex,
+				a.chapters,
+				a.currentRule,
+			)
+			a.addDebugLog("触发预加载: 后续 3 章")
 		}
 	}
-	return count
+
+	a.refreshReaderContent()
+	a.restoreReaderProgress()
+	a.setStatus("", statusInfo)
+	a.switchState(StateReader)
 }
 
-func isFinalSearchStatus(status model.SearchStatus) bool {
-	return status == model.SearchStatusSuccess ||
-		status == model.SearchStatusFailed ||
-		status == model.SearchStatusTimeout
+func (a *App) loadRelativeChapter(delta int) {
+	next := a.chapterIndex + delta
+	if next < 0 || next >= len(a.chapters) {
+		return
+	}
+	a.saveCurrentProgress()
+	a.beginLoadChapter(next)
 }
 
-func (m *Model) updateSearchStatus() {
-	m.statusMsg = m.searchStatusText()
+func (a *App) restoreReaderProgress() {
+	a.readerContent.ScrollToBeginning()
+	if !a.fromBookshelf || a.currentBook == nil || a.store == nil {
+		a.refreshChrome()
+		return
+	}
+
+	bookID := a.persistedBookID(a.currentBook)
+	if bookID == "" {
+		a.refreshChrome()
+		return
+	}
+
+	progress, err := a.store.GetReadingProgress(bookID)
+	if err != nil || progress == nil || progress.ChapterIndex != a.chapterIndex {
+		a.refreshChrome()
+		return
+	}
+
+	a.readerContent.ScrollTo(progress.LineOffset, 0)
+	a.refreshChrome()
 }
 
-func (m Model) searchStatusText() string {
-	total := m.searchSourceTotal()
+func (a *App) saveCurrentProgress() {
+	if a.store == nil || a.currentBook == nil || a.currentChapter == nil {
+		return
+	}
+
+	bookID := a.persistedBookID(a.currentBook)
+	if bookID == "" {
+		return
+	}
+
+	row, _ := a.readerContent.GetScrollOffset()
+	totalLines := a.readerContent.GetWrappedLineCount()
+	if totalLines == 0 {
+		totalLines = a.readerContent.GetOriginalLineCount()
+	}
+
+	progress := model.NewReadingProgress(
+		bookID,
+		a.currentBook.CurrentSourceID,
+		a.chapterIndex,
+		a.currentChapter.Title,
+	)
+	progress.ChapterURL = a.currentChapter.URL
+	progress.UpdatePosition(row, totalLines)
+
+	if err := a.store.SaveReadingProgress(progress); err != nil {
+		a.addDebugLog("保存进度失败: %v", err)
+		return
+	}
+
+	a.currentBook.UpdateLastRead()
+	a.currentBook.ClearUpdateMark()
+	if a.bookshelf != nil {
+		_ = a.store.SaveBookShelf(a.bookshelf)
+	}
+}
+
+func (a *App) addCurrentSelectionToBookshelf() {
+	if a.bookshelf == nil {
+		a.bookshelf = model.NewBookShelf()
+	}
+
+	var book *model.BookRecord
+	switch {
+	case a.currentBook != nil:
+		book = a.currentBook
+	case a.aggregatedResults != nil:
+		selected := a.selectedAggregatedResult()
+		source := a.selectedAggregatedSource()
+		if selected != nil && source != nil {
+			book = selected.ToBookRecordWithSource(source.SourceID)
+		}
+	case a.selectedBook != nil:
+		sourceName := ""
+		if a.currentRule != nil {
+			sourceName = a.currentRule.Name
+		}
+		book = model.NewBookRecord(a.selectedBook, sourceName)
+	}
+
+	if book == nil {
+		a.setStatus("无法添加到书架", statusError)
+		a.refreshChrome()
+		return
+	}
+
+	a.bookshelf.AddBook(book)
+	saved := a.bookshelf.FindBook(book.BookName, book.Author)
+	if saved != nil {
+		saved.SwitchSource(book.CurrentSourceID)
+		a.currentBook = saved
+	}
+
+	if a.store != nil {
+		if err := a.store.SaveBookShelf(a.bookshelf); err != nil {
+			a.setStatus(fmt.Sprintf("保存书架失败: %v", err), statusError)
+			a.refreshChrome()
+			return
+		}
+	}
+
+	sourceName := ""
+	if saved != nil {
+		if src := saved.GetCurrentSource(); src != nil {
+			sourceName = src.SourceName
+		}
+	} else if src := book.GetCurrentSource(); src != nil {
+		sourceName = src.SourceName
+	}
+
+	if sourceName == "" {
+		a.setStatus(fmt.Sprintf("已添加到书架: %s", book.BookName), statusSuccess)
+	} else {
+		a.setStatus(fmt.Sprintf("已添加到书架: %s (%s)", book.BookName, sourceName), statusSuccess)
+	}
+
+	a.refreshBookshelfList()
+	a.refreshChrome()
+}
+
+func (a *App) removeSelectedBookshelfBook() {
+	books := a.getBookshelfBooks()
+	if len(books) == 0 || a.bookshelf == nil {
+		return
+	}
+
+	index := clampIndex(a.bookshelfIndex, len(books))
+	book := books[index]
+	a.bookshelf.RemoveBook(book.ID)
+
+	if a.store != nil {
+		_ = a.store.SaveBookShelf(a.bookshelf)
+		progressStore, _ := a.store.LoadProgress()
+		if progressStore != nil {
+			progressStore.RemoveProgress(book.ID)
+			_ = a.store.SaveProgress(progressStore)
+		}
+	}
+
+	if a.bookshelfIndex >= len(books)-1 && a.bookshelfIndex > 0 {
+		a.bookshelfIndex--
+	}
+
+	a.setStatus(fmt.Sprintf("已从书架移除: %s", book.BookName), statusSuccess)
+	a.refreshBookshelfList()
+	a.refreshChrome()
+}
+
+func (a *App) checkSelectedBookUpdate() {
+	books := a.getBookshelfBooks()
+	if len(books) == 0 {
+		return
+	}
+
+	book := books[clampIndex(a.bookshelfIndex, len(books))]
+	a.setStatus("检查更新中...", statusInfo)
+	a.refreshChrome()
+
+	go func(book *model.BookRecord) {
+		result := a.checkBookUpdate(book)
+		a.app.QueueUpdateDraw(func() {
+			a.handleUpdateCheckResult(result)
+		})
+	}(book)
+}
+
+func (a *App) checkBookUpdate(book *model.BookRecord) updateCheckResult {
+	src := book.GetCurrentSource()
+	if src == nil {
+		return updateCheckResult{bookID: book.ID, err: fmt.Errorf("无可用书源")}
+	}
+
+	rule := a.findRuleBySourceID(src.SourceID)
+	if rule == nil {
+		return updateCheckResult{bookID: book.ID, err: fmt.Errorf("书源规则不存在")}
+	}
+
+	tocParser := parser.NewTocParser(rule, a.httpClient)
+	chapters, err := tocParser.Parse(src.BookURL)
+	if err != nil {
+		return updateCheckResult{bookID: book.ID, err: err}
+	}
+
+	newCount := len(chapters)
+	oldCount := book.TotalChapters
+	latestChapter := ""
+	if len(chapters) > 0 {
+		latestChapter = chapters[len(chapters)-1].Title
+	}
+
+	return updateCheckResult{
+		bookID:        book.ID,
+		hasUpdate:     newCount > oldCount,
+		newChapters:   newCount - oldCount,
+		latestChapter: latestChapter,
+	}
+}
+
+func (a *App) handleUpdateCheckResult(result updateCheckResult) {
+	if result.err != nil {
+		a.setStatus(fmt.Sprintf("检查更新失败: %v", result.err), statusError)
+		a.addDebugLog("检查更新失败: %v", result.err)
+		a.refreshChrome()
+		return
+	}
+
+	if a.bookshelf != nil {
+		book := a.bookshelf.FindBookByID(result.bookID)
+		if book != nil {
+			if result.hasUpdate {
+				book.MarkUpdate(result.newChapters, result.latestChapter)
+				a.setStatus(fmt.Sprintf("%s 有 %d 章更新", book.BookName, result.newChapters), statusSuccess)
+			} else {
+				a.setStatus(fmt.Sprintf("%s 暂无更新", book.BookName), statusInfo)
+			}
+			if a.store != nil {
+				_ = a.store.SaveBookShelf(a.bookshelf)
+			}
+		}
+	}
+
+	a.refreshBookshelfList()
+	a.refreshChrome()
+}
+
+func (a *App) openSourceSwitch() {
+	if a.currentBook == nil || len(a.currentBook.Sources) <= 1 {
+		a.setStatus("只有一个书源，无法切换", statusWarning)
+		a.refreshChrome()
+		return
+	}
+
+	a.availableSources = a.currentBook.Sources
+	a.switchIndex = 0
+	for i, src := range a.availableSources {
+		if src.SourceID == a.currentBook.CurrentSourceID {
+			a.switchIndex = i
+			break
+		}
+	}
+
+	a.refreshSourceSwitchList()
+	a.switchState(StateSourceSwitch)
+}
+
+func (a *App) switchCurrentSource() {
+	if a.currentBook == nil || len(a.availableSources) == 0 {
+		return
+	}
+
+	selected := a.availableSources[clampIndex(a.switchIndex, len(a.availableSources))]
+	if selected.SourceID == a.currentBook.CurrentSourceID {
+		a.setStatus("已是当前书源", statusInfo)
+		a.switchState(StateToc)
+		return
+	}
+
+	a.saveCurrentProgress()
+	a.currentBook.SwitchSource(selected.SourceID)
+	a.currentRule = a.findRuleBySourceID(selected.SourceID)
+	a.beginLoadToc()
+}
+
+func (a *App) matchCurrentRule() *model.Rule {
+	if a.currentBook == nil {
+		return a.currentRule
+	}
+	src := a.currentBook.GetCurrentSource()
+	if src == nil {
+		return a.currentRule
+	}
+	if rule := a.findRuleBySourceID(src.SourceID); rule != nil {
+		return rule
+	}
+	return a.currentRule
+}
+
+func (a *App) findRuleBySourceID(sourceID int) *model.Rule {
+	for _, rule := range a.rules {
+		if rule.ID == sourceID {
+			return rule
+		}
+	}
+	return nil
+}
+
+func (a *App) getBookshelfBooks() []*model.BookRecord {
+	if a.bookshelf == nil {
+		return nil
+	}
+	return a.bookshelf.GetBooksSortedByLastRead()
+}
+
+func (a *App) persistedBookID(book *model.BookRecord) string {
+	if book == nil || a.bookshelf == nil {
+		return ""
+	}
+	if existing := a.bookshelf.FindBookByID(book.ID); existing != nil {
+		return existing.ID
+	}
+	if existing := a.bookshelf.FindBook(book.BookName, book.Author); existing != nil {
+		return existing.ID
+	}
+	return ""
+}
+
+func (a *App) showLoading(title, subtitle string) {
+	a.busy = true
+	a.showingLoading = true
+	a.loadingTitle = title
+	a.loadingSubtitle = subtitle
+	a.refreshLoadingView()
+	a.contentPages.SwitchToPage(pageLoading)
+	a.refreshChrome()
+	a.app.SetFocus(a.loadingView)
+}
+
+func (a *App) hideLoading() {
+	a.busy = false
+	a.showingLoading = false
+	a.contentPages.SwitchToPage(a.pageName(a.state))
+}
+
+func (a *App) toggleReaderFullscreen() {
+	if a.state != StateReader {
+		return
+	}
+	a.readerFullscreen = !a.readerFullscreen
+	a.refreshReaderLayout()
+	a.refreshChrome()
+}
+
+func (a *App) setStatus(message string, level statusLevel) {
+	a.statusMsg = message
+	a.statusLevel = level
+}
+
+func (a *App) updateSearchStatus() {
+	a.setStatus(a.searchStatusText(), statusInfo)
+}
+
+func (a *App) searchStatusText() string {
+	total := a.searchSourceTotal()
 	if total == 0 {
 		return "未找到可搜索书源"
 	}
 
-	done := m.completedSearchSourceCount()
+	done := a.completedSearchSourceCount()
 	found := 0
-	if m.aggregatedResults != nil {
-		found = m.aggregatedResults.TotalCount
+	if a.aggregatedResults != nil {
+		found = a.aggregatedResults.TotalCount
 	}
 
-	if m.searching {
+	if a.searching {
 		if found == 0 {
 			return fmt.Sprintf("搜索中... %d/%d 个书源完成", done, total)
 		}
@@ -2276,62 +1336,151 @@ func (m Model) searchStatusText() string {
 	if found == 0 {
 		return fmt.Sprintf("未找到相关书籍 (已搜索 %d 个书源)", done)
 	}
-	return fmt.Sprintf("找到 %d 本书籍 (来自 %d 个书源)", found, m.resultSourceCount())
+	return fmt.Sprintf("找到 %d 本书籍 (来自 %d 个书源)", found, a.resultSourceCount())
 }
 
-func (m Model) searchColumnWidths() (int, int, bool) {
-	contentWidth := m.width - 4
-	if contentWidth <= 0 {
-		contentWidth = 80
+func (a *App) searchSourceTotal() int {
+	if len(a.searchProgress) > 0 {
+		return len(a.searchProgress)
 	}
-	if contentWidth < 64 {
-		return contentWidth, contentWidth, true
-	}
-
-	gap := 2
-	leftWidth := contentWidth * 45 / 100
-	if leftWidth < 30 {
-		leftWidth = 30
-	}
-	rightWidth := contentWidth - leftWidth - gap
-	if rightWidth < 30 {
-		rightWidth = 30
-		leftWidth = contentWidth - rightWidth - gap
-	}
-	if leftWidth < 24 {
-		return contentWidth, contentWidth, true
-	}
-	return leftWidth, rightWidth, false
+	return len(a.rules)
 }
 
-func (m Model) searchVisibleItems() int {
-	visibleItems := m.height - 12
-	if visibleItems < 4 {
-		visibleItems = 4
+func (a *App) completedSearchSourceCount() int {
+	count := 0
+	for _, stat := range a.searchProgress {
+		if stat != nil && isFinalSearchStatus(stat.Status) {
+			count++
+		}
 	}
-	return visibleItems
+	return count
 }
 
-func visibleWindow(index int, count int, visibleItems int) (int, int) {
-	if count <= 0 {
-		return 0, 0
+func (a *App) resultSourceCount() int {
+	count := 0
+	for _, results := range a.searchResultsBySource {
+		if len(results) > 0 {
+			count++
+		}
 	}
-	if visibleItems <= 0 || visibleItems > count {
-		visibleItems = count
+	return count
+}
+
+func (a *App) isSearchComplete() bool {
+	total := a.searchSourceTotal()
+	return total > 0 && a.completedSearchSourceCount() >= total
+}
+
+func (a *App) copySearchProgress() map[int]*model.SourceSearchStat {
+	copied := make(map[int]*model.SourceSearchStat, len(a.searchProgress))
+	for sourceID, stat := range a.searchProgress {
+		if stat == nil {
+			continue
+		}
+		value := *stat
+		copied[sourceID] = &value
+	}
+	return copied
+}
+
+func (a *App) selectedAggregatedResult() *model.AggregatedSearchResult {
+	if a.aggregatedResults == nil || len(a.aggregatedResults.Results) == 0 {
+		return nil
+	}
+	return a.aggregatedResults.Results[clampIndex(a.resultIndex, len(a.aggregatedResults.Results))]
+}
+
+func (a *App) selectedAggregatedSource() *model.SearchResultWithSource {
+	selected := a.selectedAggregatedResult()
+	if selected == nil || len(selected.Sources) == 0 {
+		return nil
+	}
+	return selected.Sources[clampIndex(a.sourceIndex, len(selected.Sources))]
+}
+
+func (a *App) selectedAggregatedKey() string {
+	selected := a.selectedAggregatedResult()
+	if selected == nil {
+		return ""
+	}
+	return selected.NormalizedKey
+}
+
+func (a *App) selectedAggregatedSourceID() int {
+	selected := a.selectedAggregatedSource()
+	if selected == nil {
+		return 0
+	}
+	return selected.SourceID
+}
+
+func (a *App) restoreSearchSelection(selectedKey string, selectedSourceID int) {
+	if a.aggregatedResults == nil || len(a.aggregatedResults.Results) == 0 {
+		a.resultIndex = 0
+		a.sourceIndex = 0
+		return
 	}
 
-	index = clampIndex(index, count)
-	start := 0
-	if index >= visibleItems {
-		start = index - visibleItems + 1
+	if selectedKey != "" {
+		for i, result := range a.aggregatedResults.Results {
+			if result.NormalizedKey == selectedKey {
+				a.resultIndex = i
+				break
+			}
+		}
 	}
-	if start+visibleItems > count {
-		start = count - visibleItems
+	a.resultIndex = clampIndex(a.resultIndex, len(a.aggregatedResults.Results))
+
+	selected := a.aggregatedResults.Results[a.resultIndex]
+	if selectedSourceID != 0 {
+		for i, src := range selected.Sources {
+			if src.SourceID == selectedSourceID {
+				a.sourceIndex = i
+				return
+			}
+		}
 	}
-	if start < 0 {
-		start = 0
+	a.sourceIndex = clampIndex(a.sourceIndex, len(selected.Sources))
+}
+
+func isFinalSearchStatus(status model.SearchStatus) bool {
+	return status == model.SearchStatusSuccess ||
+		status == model.SearchStatusFailed ||
+		status == model.SearchStatusTimeout
+}
+
+func (a *App) addDebugLog(format string, args ...any) {
+	entry := fmt.Sprintf("%s %s", time.Now().Format("15:04:05"), fmt.Sprintf(format, args...))
+	a.debugLogs = append(a.debugLogs, entry)
+	if len(a.debugLogs) > a.maxDebugLogs {
+		a.debugLogs = a.debugLogs[len(a.debugLogs)-a.maxDebugLogs:]
 	}
-	return start, start + visibleItems
+	if a.debugView != nil && a.showDebugLog && a.state == StateReader {
+		a.refreshReaderDebug()
+	}
+}
+
+func (a *App) handleResize() {
+	if a.searchLayout != nil {
+		if a.width > 0 && a.width < 110 {
+			a.searchLayout.SetDirection(tview.FlexRow)
+		} else {
+			a.searchLayout.SetDirection(tview.FlexColumn)
+		}
+	}
+	if a.state == StateReader {
+		a.refreshChrome()
+	}
+}
+
+func (a *App) scheduleReaderChromeRefresh() {
+	time.AfterFunc(0, func() {
+		a.app.QueueUpdateDraw(func() {
+			if a.state == StateReader {
+				a.refreshChrome()
+			}
+		})
+	})
 }
 
 func clampIndex(index int, count int) int {
@@ -2347,26 +1496,27 @@ func clampIndex(index int, count int) int {
 	return index
 }
 
-func truncateDisplay(s string, width int) string {
-	if width <= 0 {
-		return ""
+func sanitizeSingleLine(text string) string {
+	text = strings.TrimSpace(text)
+	text = strings.ReplaceAll(text, "\r", " ")
+	text = strings.ReplaceAll(text, "\n", " ")
+	text = strings.ReplaceAll(text, "\t", " ")
+	for strings.Contains(text, "  ") {
+		text = strings.ReplaceAll(text, "  ", " ")
 	}
-	if runewidth.StringWidth(s) <= width {
-		return s
-	}
-	if width <= 3 {
-		return runewidth.Truncate(s, width, "")
-	}
-	return runewidth.Truncate(s, width, "...")
+	return text
 }
 
-// addDebugLog 添加调试日志
-func (m *Model) addDebugLog(format string, args ...any) {
-	timestamp := time.Now().Format("15:04:05")
-	log := fmt.Sprintf("[%s] %s", timestamp, fmt.Sprintf(format, args...))
-	m.debugLogs = append(m.debugLogs, log)
-	// 限制日志数量
-	if len(m.debugLogs) > m.maxDebugLogs {
-		m.debugLogs = m.debugLogs[len(m.debugLogs)-m.maxDebugLogs:]
+func truncateText(text string, limit int) string {
+	if limit <= 0 {
+		return ""
 	}
+	runes := []rune(text)
+	if len(runes) <= limit {
+		return text
+	}
+	if limit <= 3 {
+		return string(runes[:limit])
+	}
+	return string(runes[:limit-3]) + "..."
 }
